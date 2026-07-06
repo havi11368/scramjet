@@ -249,6 +249,7 @@ export async function route(event: FetchEvent): Promise<Response> {
                         height: 20em;
                         text-align: left;
                         font-family: var(--font-monospace);
+						cursor: text;
                     }
 
                     body {
