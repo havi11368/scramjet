@@ -3,8 +3,7 @@
 import { RpcHelper } from "@mercuryworkshop/rpc";
 import type { Controllerbound, SWbound } from "./types";
 import type { RawHeaders } from "@mercuryworkshop/proxy-transports";
-import { versionInfo } from "@mercuryworkshop/scramjet";
-
+import { VERSION } from "./version";
 function makeId(): string {
 	return Math.random().toString(36).substring(2, 10);
 }
@@ -357,7 +356,7 @@ export async function route(event: FetchEvent): Promise<Response> {
                         <br>
                         <button id="reload" class="primary" onclick="window.location.reload()">Reload</button>
                     </div>
-                    <p id="version-wrapper"><i>Scramjet v<span id="version"></span> (build <span id="build"></span>)</i></p>
+                    <p id="version-wrapper"><i>Scramjet Controller v<span id="version">${VERSION}</span></p>
                 </body>
 				<script>
 					function copyError() {
