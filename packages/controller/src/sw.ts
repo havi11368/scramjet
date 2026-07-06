@@ -233,6 +233,7 @@ export async function route(event: FetchEvent): Promise<Response> {
                         appearance: none;
                         font-family: var(--font-sans);
                         color: var(--beach);
+						cursor: pointer;
                     }
 
                     button.primary {
