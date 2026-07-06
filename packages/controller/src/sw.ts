@@ -342,10 +342,10 @@ export async function route(event: FetchEvent): Promise<Response> {
                                     <li>Checking your internet connection</li>
                                     <li>Verifying you entered the correct address</li>
                                     <li>Clearing the site data</li>
-                                    <li>Contacting <b id="hostname">${event.request.referrer}</b>'s administrator</li>
+                                    <li>Contacting <b id="hostname">${event.request.referrer.replace("http", "").replace("s:", "").replace(":", "").replaceAll("/", "")}</b>'s administrator</li>
                                     <li>Verify the server isn't censored</li>
                                 </ul>
-                                <p>If you're the administrator of <b id="hostname">${event.request.referrer}</b>, try:</p>
+                                <p>If you're the administrator of <b id="hostname">${event.request.referrer.replace("http", "").replace("s:", "").replace(":", "").replaceAll("/", "")}</b>, try:</p>
                                     <ul>
                                     <li>Restarting your server</li>
                                     <li>Updating Scramjet</li>
