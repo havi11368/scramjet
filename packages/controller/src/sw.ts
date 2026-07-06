@@ -355,7 +355,7 @@ export async function route(event: FetchEvent): Promise<Response> {
                         <br>
                         <button id="reload" class="primary">Reload</button>
                     </div>
-                    <p id="version-wrapper"><i>Scramjet v<span id="version">${versionInfo.version}</span> (build <span id="build">${versionInfo.build}</span>)</i></p>
+                    <p id="version-wrapper"><i>Scramjet v<span id="version"></span> (build <span id="build"></span>)</i></p>
                 </body>
             </html>`,
 			{
