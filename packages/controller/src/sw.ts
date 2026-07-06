@@ -328,7 +328,7 @@ export async function route(event: FetchEvent): Promise<Response> {
                     <div id="cover"></div>
                     <div id="inner">
                         <h1 id="errorTitle">Uh oh!</h1>
-                        <p>There was an error loading <b id="fetchedURL"></b></p>
+                        <p>There was an error loading <b id="fetchedURL">${decodeURIComponent(event.request.url.replace(event.request.referrer, "").slice(23))}</b></p>
                         <!-- <p id="errorMessage">Internal Server Error</p> -->
 
                         <div id="info">
