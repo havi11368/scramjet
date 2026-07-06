@@ -201,7 +201,6 @@ export async function route(event: FetchEvent): Promise<Response> {
 			headers: response.headers,
 		});
 	} catch (e) {
-		const client = await clients.get(event.clientId);
 		console.error("Service Worker error:", e);
 		return new Response(
 			`<!DOCTYPE html>
@@ -335,7 +334,7 @@ export async function route(event: FetchEvent): Promise<Response> {
                         <div id="info">
                             <div id="errorTrace-wrapper">
                                 <textarea id="errorTrace" cols="40" rows="10" readonly>Internal SW Error: ${(e as Error).message}</textarea>
-                                <button id="copy-button" class="primary">Copy</button>
+                                <button id="copy-button" class="primary" onclick="copyError()">Copy</button>
                             </div>
                             <div id="troubleshooting">
                                 <p>Try:</p>
@@ -353,12 +352,19 @@ export async function route(event: FetchEvent): Promise<Response> {
                                     <li>Troubleshooting the error on the <a href="https://github.com/MercuryWorkshop/scramjet" target="_blank">GitHub repository</a></li>
                                 </ul>
                             </div>
+							<!--i wish i could add the proxy fail gif from tn, but then that would just be unprofessional - havi11368-->
                         </div>
                         <br>
-                        <button id="reload" class="primary">Reload</button>
+                        <button id="reload" class="primary" onclick="window.location.reload()">Reload</button>
                     </div>
                     <p id="version-wrapper"><i>Scramjet v<span id="version"></span> (build <span id="build"></span>)</i></p>
                 </body>
+				<script>
+					function copyError() {
+						navigator.clipboard.writeText(document.querySelector("#errorTrace").value)
+						document.querySelector("#copy-button").innerHTML = "Copied!"
+					}
+				</script>
             </html>`,
 			{
 				status: 500,
