@@ -3,6 +3,7 @@
 import { RpcHelper } from "@mercuryworkshop/rpc";
 import type { Controllerbound, SWbound } from "./types";
 import type { RawHeaders } from "@mercuryworkshop/proxy-transports";
+import { versionInfo } from "@mercuryworkshop/scramjet";
 
 function makeId(): string {
 	return Math.random().toString(36).substring(2, 10);
@@ -331,7 +332,7 @@ export async function route(event: FetchEvent): Promise<Response> {
 
                         <div id="info">
                             <div id="errorTrace-wrapper">
-                                <textarea id="errorTrace" cols="40" rows="10" readonly></textarea>
+                                <textarea id="errorTrace" cols="40" rows="10" readonly>Internal SW Error: ${(e as Error).message}</textarea>
                                 <button id="copy-button" class="primary">Copy</button>
                             </div>
                             <div id="troubleshooting">
@@ -354,7 +355,7 @@ export async function route(event: FetchEvent): Promise<Response> {
                         <br>
                         <button id="reload" class="primary">Reload</button>
                     </div>
-                    <p id="version-wrapper"><i>Scramjet v<span id="version"></span> (build <span id="build"></span>)</i></p>
+                    <p id="version-wrapper"><i>Scramjet v<span id="version">${versionInfo.version}</span> (build <span id="build">${versionInfo.build}</span>)</i></p>
                 </body>
             </html>`,
 			{
