@@ -13,7 +13,7 @@ import {
 import { rewriteUrl, unrewriteBlob, unrewriteUrl } from "@rewriters/url";
 import { QP, parseRequest } from "./parse";
 import { ScramjetHeaders } from "@/shared";
-import { isDocument, isRedirect, normalizeContentType, normalizeContentTypeWOmimeCheck } from "./util";
+import { isDocument, isRedirect, normalizeContentType } from "./util";
 import { rewriteBody } from "./body";
 import { Tap } from "@/Tap";
 import {
@@ -154,14 +154,14 @@ export async function doHandleFetch(
 		// After rewriting HTML, the body is a JS string which will be encoded as
 		// UTF-8 by the Response constructor. Normalize the Content-Type charset so
 		// the browser doesn't try to decode UTF-8 bytes with the original encoding.
-		normalizeContentType(parsed, responseHeaders);
+		normalizeContentType(parsed, responseHeaders, false);
 	}
 	if (response.body && response.status == 500) {
 		responseBody = await rewriteBody(handler, request, parsed, response);
 
 		// it's just the top if statement but modified to skip the mime check if
         // the response status if 500
-		normalizeContentTypeWOmimeCheck(parsed, responseHeaders);
+		normalizeContentType(parsed, responseHeaders, true);
 	}
 
 	const respcontext: typeof handler.hooks.fetch.response.context = {

@@ -4,25 +4,14 @@ import { ScramjetFetchParsed } from ".";
 
 export function normalizeContentType(
 	parsed: ScramjetFetchParsed,
-	headers: ScramjetHeaders
+	headers: ScramjetHeaders,
+	skipMimecheck: boolean
 ) {
 	if (!isDocument(parsed)) return;
 
 	const ct = headers.get("content-type");
 	if (!ct) return;
-	if (!isHtmlMimeType(ct)) return;
-
-	headers.set("content-type", "text/html; charset=utf-8");
-}
-
-export function normalizeContentTypeWOmimeCheck(
-	parsed: ScramjetFetchParsed,
-	headers: ScramjetHeaders
-) {
-	if (!isDocument(parsed)) return;
-
-	const ct = headers.get("content-type");
-	if (!ct) return;
+	if (!isHtmlMimeType(ct) && skipMimecheck == false) return;
 
 	headers.set("content-type", "text/html; charset=utf-8");
 }
