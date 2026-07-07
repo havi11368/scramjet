@@ -159,9 +159,8 @@ export async function doHandleFetch(
 	if (response.body && response.status == 500) {
 		responseBody = await rewriteBody(handler, request, parsed, response);
 
-		// After rewriting HTML, the body is a JS string which will be encoded as
-		// UTF-8 by the Response constructor. Normalize the Content-Type charset so
-		// the browser doesn't try to decode UTF-8 bytes with the original encoding.
+		// it's just the top if statement but modified to skip the mime check if
+        // the response status if 500
 		normalizeContentTypeWOmimeCheck(parsed, responseHeaders);
 	}
 
