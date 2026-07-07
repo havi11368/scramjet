@@ -15,6 +15,18 @@ export function normalizeContentType(
 	headers.set("content-type", "text/html; charset=utf-8");
 }
 
+export function normalizeContentTypeWOmimeCheck(
+	parsed: ScramjetFetchParsed,
+	headers: ScramjetHeaders
+) {
+	if (!isDocument(parsed)) return;
+
+	const ct = headers.get("content-type");
+	if (!ct) return;
+
+	headers.set("content-type", "text/html; charset=utf-8");
+}
+
 export function isRedirect(response: BareResponse) {
 	return response.status >= 300 && response.status < 400;
 }

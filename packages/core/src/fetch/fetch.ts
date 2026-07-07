@@ -13,7 +13,7 @@ import {
 import { rewriteUrl, unrewriteBlob, unrewriteUrl } from "@rewriters/url";
 import { QP, parseRequest } from "./parse";
 import { ScramjetHeaders } from "@/shared";
-import { isDocument, isRedirect, normalizeContentType } from "./util";
+import { isDocument, isRedirect, normalizeContentType, normalizeContentTypeWOmimeCheck } from "./util";
 import { rewriteBody } from "./body";
 import { Tap } from "@/Tap";
 import {
@@ -155,6 +155,14 @@ export async function doHandleFetch(
 		// UTF-8 by the Response constructor. Normalize the Content-Type charset so
 		// the browser doesn't try to decode UTF-8 bytes with the original encoding.
 		normalizeContentType(parsed, responseHeaders);
+	}
+	if (response.body && response.status == 500) {
+		responseBody = await rewriteBody(handler, request, parsed, response);
+
+		// After rewriting HTML, the body is a JS string which will be encoded as
+		// UTF-8 by the Response constructor. Normalize the Content-Type charset so
+		// the browser doesn't try to decode UTF-8 bytes with the original encoding.
+		normalizeContentTypeWOmimeCheck(parsed, responseHeaders);
 	}
 
 	const respcontext: typeof handler.hooks.fetch.response.context = {
