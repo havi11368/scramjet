@@ -159,8 +159,8 @@ export async function doHandleFetch(
 	if (response.body && response.status == 500) {
 		responseBody = await rewriteBody(handler, request, parsed, response);
 
-		// it's just the top if statement but modified to skip the mime check if
-        // the response status if 500
+		// it's just the top if statement but modified to have skipmimecheck to true
+        // if the response status if 500
 		normalizeContentType(parsed, responseHeaders, true);
 	}
 
