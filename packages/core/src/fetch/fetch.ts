@@ -154,14 +154,12 @@ export async function doHandleFetch(
 		// After rewriting HTML, the body is a JS string which will be encoded as
 		// UTF-8 by the Response constructor. Normalize the Content-Type charset so
 		// the browser doesn't try to decode UTF-8 bytes with the original encoding.
-		normalizeContentType(parsed, responseHeaders, false);
-	}
-	if (response.body && response.url.includes("csb.app")) {
-		responseBody = await rewriteBody(handler, request, parsed, response);
 
-		// it's just the top if statement but modified to have skipmimecheck to true
-        // if the response status if 500
-		normalizeContentType(parsed, responseHeaders, true);
+		if (response.url.includes("csb.app")) { // you can add more sites that break like that to the if statement ig
+			normalizeContentType(parsed, responseHeaders, true);
+		} else {
+			normalizeContentType(parsed, responseHeaders, false)
+		}
 	}
 
 	const respcontext: typeof handler.hooks.fetch.response.context = {
