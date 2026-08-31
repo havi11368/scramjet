@@ -154,12 +154,12 @@ export async function doHandleFetch(
 		// After rewriting HTML, the body is a JS string which will be encoded as
 		// UTF-8 by the Response constructor. Normalize the Content-Type charset so
 		// the browser doesn't try to decode UTF-8 bytes with the original encoding.
-
-		if (response.url.includes("csb.app")) { // you can add more sites that break like that to the if statement ig
-			normalizeContentType(parsed, responseHeaders, true);
-		} else {
-			normalizeContentType(parsed, responseHeaders, false)
-		}
+		normalizeContentType(parsed, responseHeaders, false)
+	}
+		if (response.status == 400) {
+		setTimeout(() => {
+		responseHeaders.set("location", responseHeaders.get("location"))
+		}, 2000)
 	}
 
 	const respcontext: typeof handler.hooks.fetch.response.context = {
@@ -273,7 +273,7 @@ async function handleBlobOrDataUrlFetch(
 	const headers = ScramjetHeaders.fromRawHeaders(response.rawHeaders);
 
 	// blob urls actually *can* set charsets, so we need to normalize them if it goes down the html path
-	normalizeContentType(parsed, headers);
+	normalizeContentType(parsed, headers, false);
 
 	if (handler.crossOriginIsolated) {
 		headers.set("Cross-Origin-Opener-Policy", "same-origin");
