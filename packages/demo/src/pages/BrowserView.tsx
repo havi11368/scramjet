@@ -142,6 +142,169 @@ Omnibox.style = css`
 	}
 `;
 
+let errorPage = `<!DOCTYPE html>
+            <html>
+                <head>
+                    <meta charset="utf-8" />
+                    <title>Scramjet</title>
+                    <style>
+                    :root {
+                        --deep: #080602;
+                        --shallow: #181412;
+                        --beach: #f1e8e1;
+                        --shore: #b1a8a1;
+                        --accent: #ffa938;
+                        --font-sans: -apple-system, system-ui, BlinkMacSystemFont, sans-serif;
+                        --font-monospace: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+                    }
+
+                    *:not(div,p,span,ul,li,i,span) {
+                        background-color: var(--deep);
+                        color: var(--beach);
+                        font-family: var(--font-sans);
+                    }
+
+                    textarea,
+                    button {
+                        background-color: var(--shallow);
+                        border-radius: 0.6em;
+                        padding: 0.6em;
+                        border: none;
+                        appearance: none;
+                        font-family: var(--font-sans);
+                        color: var(--beach);
+						cursor: pointer;
+                    }
+
+                    button.primary {
+                        background-color: var(--accent);
+                        color: var(--deep);
+                        font-weight: bold;
+                    }
+
+                    textarea {
+                        resize: none;
+                        height: 20em;
+                        text-align: left;
+                        font-family: var(--font-monospace);
+						cursor: text;
+                    }
+
+                    body {
+                        width: 100vw;
+                        height: 100vh;
+                        justify-content: center;
+                        align-items: center;
+                    }
+
+                    body,
+                    html,
+                    #inner {
+                        display: flex;
+                        align-items: center;
+                        flex-direction: column;
+                        gap: 0.5em;
+                        overflow: hidden;
+                    }
+
+                    #inner {
+                        z-index: 100;
+                    }
+
+                    #cover {
+                        position: absolute;
+                        width: 100%;
+                        height: 100%;
+                        background-color: color-mix(in srgb, var(--deep) 70%, transparent);
+                        z-index: 99;
+                    }
+
+                    #info {
+                        display: flex;
+                        flex-direction: row;
+                        align-items: flex-start;
+                        gap: 1em;
+                    }
+
+                    #version-wrapper {
+                        width: auto;
+                        text-align: right;
+                        position: absolute;
+                        top: 0.5rem;
+                        right: 0.5rem;
+                        font-size: 0.8rem;
+                        color: var(--shore)!important;
+                        i {
+                            background-color: color-mix(in srgb, var(--deep), transparent 50%);
+                            border-radius: 9999px;
+                            padding: 0.2em 0.5em;
+                        }
+                        z-index: 101;
+                    }
+
+                    #errorTrace-wrapper {
+                        position: relative;
+                        width: fit-content;
+                    }
+
+                    #copy-button {
+                        position: absolute;
+                        top: 0.5em;
+                        right: 0.5em;
+                        padding: 0.23em;
+                        cursor: pointer;
+                        opacity: 0;
+                        transition: opacity 0.4s;
+                        font-size: 0.9em;
+                    }
+
+                    #errorTrace-wrapper:hover #copy-button {
+                        opacity: 1;
+                    }
+                    </style>
+                </head>
+                <body>
+                    <div id="cover"></div>
+                    <div id="inner">
+                        <h1 id="errorTitle">Uh oh!</h1>
+                        <p>There was an error loading <b id="fetchedURL">{{URL}}</b></p>
+                        <!-- <p id="errorMessage">Internal Server Error</p> -->
+
+                        <div id="info">
+                            <div id="errorTrace-wrapper">
+                                <textarea id="errorTrace" cols="40" rows="10" readonly>Internal Service Worker Error: {{ERROR}}</textarea>
+                                <button id="copy-button" class="primary" onclick="copyError()">Copy</button>
+                            </div>
+                            <div id="troubleshooting">
+                                <p>Try:</p>
+                                <ul>
+                                    <li>Checking your internet connection</li>
+                                    <li>Verifying you entered the correct address</li>
+                                    <li>Clearing the site data</li>
+                                    <li>Contacting <b id="hostname">{{ORIGIN}}</b>'s administrator</li>
+                                    <li>Verify the server isn't censored</li>
+                                </ul>
+                                <p>If you're the administrator of <b id="hostname">{{ORIGIN}}</b>, try:</p>
+                                    <ul>
+                                    <li>Restarting your server</li>
+                                    <li>Updating Scramjet</li>
+                                    <li>Troubleshooting the error on the <a href="https://github.com/MercuryWorkshop/scramjet" target="_blank">GitHub repository</a></li>
+                                </ul>
+                            </div>
+                        </div>
+                        <br>
+                        <button id="reload" class="primary" onclick="window.location.reload()">Reload</button>
+                    </div>
+                    <p id="version-wrapper"><i>Scramjet v<span id="version">{{SCRAMJET_VERSION}}</span> (build <span id="build">{{SCRAMJET_BUILD}}</span>)</i></p>
+					<script>
+					function copyError() {
+						navigator.clipboard.writeText(document.querySelector("#errorTrace").value)
+						document.querySelector("#copy-button").innerHTML = "Copied!"
+					}
+				</script>
+                </body>
+            </html>`
+
 const BrowserView: Component<
 	{
 		active: boolean;
@@ -161,8 +324,9 @@ const BrowserView: Component<
 			(url) =>
 				new URL(`/?goto=${encodeURIComponent(url.href)}`, location.origin)
 		);
+		let customErrorPage = new customErrorPagePlugin(errorPage);
 		browserState.frame = controller.createFrame(this.frameel, {
-			plugins: [cachePlugin, urlWatcher, catchEscapedLinks],
+			plugins: [cachePlugin, urlWatcher, catchEscapedLinks, customErrorPage],
 		});
 		let realHomepage = homepage;
 		realHomepage = realHomepage.replaceAll(
