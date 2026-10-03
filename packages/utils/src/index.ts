@@ -22,5 +22,5 @@ export {
 	LinkHandlerPlugin,
 	type LinkHandlerPluginOptions,
 } from "./link-handler-plugin";
-export { customErrorPagePlugin } from "./customErrorPage";
+export { customErrorPagePlugin } from "./custom-error-page";
 assertDependencyVersions();

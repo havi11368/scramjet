@@ -169,6 +169,7 @@ const BrowserView: Component<
 <body>
 {{SCRAMJET_VERSION}}
 {{SCRAMJET_BUILD}}
+{{ORIGIN}}
 {{URL}}
 {{ERROR}}
 </body></html>`);
