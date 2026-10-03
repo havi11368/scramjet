@@ -7,6 +7,7 @@ import {
 import {
 	CatchEscapedLinksPlugin,
 	UrlWatcherPlugin,
+	customErrorPagePlugin,
 } from "@mercuryworkshop/scramjet-utils";
 import { versionInfo } from "@mercuryworkshop/scramjet";
 import { cachePlugin, controller } from "..";
@@ -160,6 +161,9 @@ const BrowserView: Component<
 			(url) =>
 				new URL(`/?goto=${encodeURIComponent(url.href)}`, location.origin)
 		);
+		let customErrorPage = new customErrorPagePlugin((url) => {
+			browserState.url = url;
+		});
 		browserState.frame = controller.createFrame(this.frameel, {
 			plugins: [cachePlugin, urlWatcher, catchEscapedLinks],
 		});
