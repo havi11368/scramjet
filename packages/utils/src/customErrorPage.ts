@@ -10,10 +10,11 @@ export class customErrorPagePlugin extends ManagedPlugin {
     install(frame: Frame): void {
         this.tap(
             frame.hooks.error.request, (context: any, props: any) => {
-               props.setResponse = (this.content, [
-							"content-type: text/html; charset=utf-8",
-							"cache-control: no-store",
-               ], 500, "Internal Server Error") /*new Response(
+                
+               props.setResponse = {body: this.content, headers: {
+							"content-type": "text/html; charset=utf-8"},
+                status: 500, statusText: "Internal Server Error"}
+               props.suppressError = false /*new Response(
 					this.content,
 					{
 						status: 500,
