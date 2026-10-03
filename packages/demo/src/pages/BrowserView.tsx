@@ -288,7 +288,6 @@ let errorPage = `<!DOCTYPE html>
                                     <ul>
                                     <li>Restarting your server</li>
                                     <li>Updating Scramjet</li>
-                                    <li>Troubleshooting the error on the <a href="https://github.com/MercuryWorkshop/scramjet" target="_blank">GitHub repository</a></li>
                                 </ul>
                             </div>
                         </div>
