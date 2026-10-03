@@ -3,15 +3,15 @@ import type { Frame } from "@mercuryworkshop/scramjet-controller";
 
 export class customErrorPagePlugin extends ManagedPlugin {
     constructor(
-            content: string
+            private content: string
         ) {
-            super("url-watcher", []);
+            super("error-page", []);
         }
     install(frame: Frame): void {
         this.tap(
             frame.hooks.error.request, (context: any, props: any) => {
-               props.earlyResponse = new Response(
-					`hi scrammy`,
+               props.setResponse = new Response(
+					this.content,
 					{
 						status: 500,
 						headers: {

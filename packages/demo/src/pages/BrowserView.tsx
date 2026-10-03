@@ -161,11 +161,9 @@ const BrowserView: Component<
 			(url) =>
 				new URL(`/?goto=${encodeURIComponent(url.href)}`, location.origin)
 		);
-		let customErrorPage = new customErrorPagePlugin((url) => {
-			browserState.url = url;
-		});
+		let customErrorPage = new customErrorPagePlugin("hi");
 		browserState.frame = controller.createFrame(this.frameel, {
-			plugins: [cachePlugin, urlWatcher, catchEscapedLinks],
+			plugins: [cachePlugin, urlWatcher, catchEscapedLinks, customErrorPage],
 		});
 		let realHomepage = homepage;
 		realHomepage = realHomepage.replaceAll(
