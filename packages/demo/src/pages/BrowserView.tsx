@@ -161,20 +161,8 @@ const BrowserView: Component<
 			(url) =>
 				new URL(`/?goto=${encodeURIComponent(url.href)}`, location.origin)
 		);
-		let customErrorPage = new customErrorPagePlugin(`<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252">
-
-<title>This Website Has Been Seized</title>
-</head>
-
-<body>
-{{SCRAMJET_VERSION}}
-{{SCRAMJET_BUILD}}
-{{ORIGIN}}
-{{URL}}
-{{ERROR}}
-</body></html>`);
 		browserState.frame = controller.createFrame(this.frameel, {
-			plugins: [cachePlugin, urlWatcher, catchEscapedLinks, customErrorPage],
+			plugins: [cachePlugin, urlWatcher, catchEscapedLinks],
 		});
 		let realHomepage = homepage;
 		realHomepage = realHomepage.replaceAll(
