@@ -282,7 +282,9 @@ let errorPage = `<!DOCTYPE html>
                                     <li>Verifying you entered the correct address</li>
                                     <li>Clearing the site data</li>
                                     <li>Contacting <b id="hostname">{{ORIGIN}}</b>'s administrator</li>
-                                    <li>Verify the server isn't censored</li>
+                                    <li>Switching between the <b>Epoxy</b> and <b>Libcurl</b> transports</li>
+                                    <li>Verifying the wisp server isn't blocked</li>
+                                    <li>Switching to a new wisp server using proxy settings</li>
                                 </ul>
                                 <p>If you're the administrator of <b id="hostname">{{ORIGIN}}</b>, try:</p>
                                     <ul>
