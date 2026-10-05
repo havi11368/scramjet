@@ -284,7 +284,7 @@ let errorPage = `<!DOCTYPE html>
                                     <li>Contacting <b id="hostname">{{ORIGIN}}</b>'s administrator</li>
                                     <li>Switching between the <b>Epoxy</b> and <b>Libcurl</b> transports</li>
                                     <li>Verifying the wisp server isn't blocked</li>
-                                    <li>Switching to a new wisp server using proxy settings</li>
+                                    <li>Using a different wisp server</li>
                                 </ul>
                                 <p>If you're the administrator of <b id="hostname">{{ORIGIN}}</b>, try:</p>
                                     <ul>
