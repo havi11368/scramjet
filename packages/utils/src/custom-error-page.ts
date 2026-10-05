@@ -24,7 +24,10 @@ export class customErrorPagePlugin extends ManagedPlugin {
               .replace(location.origin, "")
               .slice(24),
           )
-          .replaceAll("{{ERROR}}", context.error),
+          .replaceAll(
+            "{{ERROR}}",
+            "Internal Service Worker Error: " + context.error,
+          ),
         headers: {
           "content-type": "text/html; charset=utf-8",
         },

@@ -272,7 +272,7 @@ let errorPage = `<!DOCTYPE html>
 
                         <div id="info">
                             <div id="errorTrace-wrapper">
-                                <textarea id="errorTrace" cols="40" rows="10" readonly>Internal Service Worker Error: {{ERROR}}</textarea>
+                                <textarea id="errorTrace" cols="40" rows="10" readonly>{{ERROR}}</textarea>
                                 <button id="copy-button" class="primary" onclick="copyError()">Copy</button>
                             </div>
                             <div id="troubleshooting">
