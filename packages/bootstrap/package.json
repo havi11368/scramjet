@@ -12,20 +12,20 @@
 		"directory": "packages/bootstrap"
 	},
 	"scripts": {
-		"build": "cd ../.. && rspack build --mode production --configName scramjet-bootstrap",
+		"build": "cd ../.. && rspack build --mode production",
 		"prepack": "pnpm build",
 		"prepublishOnly": "npx only-allow pnpm",
 		"pub": "pnpm publish --no-git-checks --access public"
 	},
 	"dependencies": {
 		"@mercuryworkshop/wisp-js": "catalog:",
+		"@mercuryworkshop/scramjet-controller": "workspace:*",
 		"tar": "^7.5.1"
 	},
 	"devDependencies": {
 		"@mercuryworkshop/epoxy-transport": "catalog:",
 		"@mercuryworkshop/libcurl-transport": "catalog:",
-		"@mercuryworkshop/proxy-transports": "catalog:",
-		"@mercuryworkshop/scramjet-controller": "workspace:*"
+		"@mercuryworkshop/proxy-transports": "catalog:"
 	},
 	"files": [
 		"dist"

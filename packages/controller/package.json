@@ -1,6 +1,6 @@
 {
 	"name": "@mercuryworkshop/scramjet-controller",
-	"version": "0.0.14",
+	"version": "0.1.0",
 	"type": "module",
 	"packageManager": "pnpm@10.12.1",
 	"license": "AGPL-3.0-only",
@@ -13,13 +13,17 @@
 		"directory": "packages/controller"
 	},
 	"scripts": {
-		"build": "cd ../.. && rspack build --mode production --config-name scramjet-esmodule --config-name scramjet-controller",
+		"build": "cd ../.. && rspack build --mode production --config-name scramjet-iife --config-name scramjet-controller",
 		"prepack": "pnpm build"
 	},
 	"exports": {
 		".": {
 			"types": "./dist/types/typesEntry.d.ts",
 			"default": "./dist/controller-external.mjs"
+		},
+		"./path": {
+			"types": "./lib/index.d.ts",
+			"default": "./lib/index.cjs"
 		}
 	},
 	"peerDependencies": {
@@ -27,11 +31,13 @@
 	},
 	"dependencies": {
 		"@fastify/deepmerge": "^3.2.1",
-		"@mercuryworkshop/proxy-transports": "catalog:"
+		"@mercuryworkshop/proxy-transports": "catalog:",
+		"semver": "^7.7.3"
 	},
 	"devDependencies": {
+		"@mercuryworkshop/rpc": "workspace:*",
 		"@mercuryworkshop/scramjet": "workspace:*",
-		"@types/serviceworker": "^0.0.197",
-		"@mercuryworkshop/rpc": "workspace:*"
+		"@types/semver": "^7.8.0",
+		"@types/serviceworker": "^0.0.197"
 	}
 }

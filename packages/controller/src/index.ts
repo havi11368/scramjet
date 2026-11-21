@@ -33,9 +33,7 @@ import type {
 } from "./types";
 import { assertRuntimeScramjetVersion } from "./version";
 
-export { VERSION } from "./version";
-export { assertRuntimeScramjetVersion } from "./version";
-
+export { versionInfo } from "./version";
 export type Config = {
 	prefix: string;
 	scramjetPath: string;
@@ -210,7 +208,7 @@ type ControllerInit = {
 };
 
 type FrameOptions = {
-	plugins: ManagedPlugin[];
+	plugins?: ManagedPlugin[];
 };
 
 export class Controller {
@@ -275,7 +273,7 @@ export class Controller {
 			const frame = this.frames.find((f) => path.startsWith(f.prefix));
 			if (!frame) throw new Error("No frame found for request");
 			try {
-				// doesn't actually *load* every request, but hold up requests until the promise finishes
+				// doesn't actually *load* every request, but hold u requests until the promise finishes
 				await this.loadSavedCookies();
 
 				if (path === frame.prefix + this.config.virtualWasmPath) {
@@ -854,9 +852,9 @@ export class Frame {
 
 	go(url: string) {
 		const encoded = rewriteUrl(url, this.context, {
-			//@ts-expect-error
+			//@ts-expect-error TODO: fix branded types leaking into core api
 			origin: new URL(location.href),
-			//@ts-expect-error
+			//@ts-expect-error TODO: fix branded types leaking into core api
 			base: new URL(location.href),
 		});
 		this.element.src = encoded;
