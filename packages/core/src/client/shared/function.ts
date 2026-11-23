@@ -1,10 +1,24 @@
 import { rewriteJs } from "@rewriters/js";
 import { ScramjetClient, ProxyCtx, Proxy } from "@client/index";
+import { assertEvalAllowed } from "@client/csp";
+import { String } from "@/shared/snapshot";
 
 function rewriteFunction<T extends string, U extends "construct" | "apply">(
 	ctx: ProxyCtx<T, U>,
 	client: ScramjetClient
 ) {
+	// CreateDynamicFunction converts arguments before the host CSP check, but
+	// parses them afterwards. Letting the native constructor parse first would
+	// incorrectly return SyntaxError instead of the policy's EvalError.
+	// https://tc39.es/ecma262/#sec-createdynamicfunction
+	for (let i = 0; i < ctx.args.length; i++) {
+		if (typeof ctx.args[i] === "symbol") {
+			const global = new client.native.window(client.global);
+			throw new global.TypeError("Cannot convert a Symbol value to a string");
+		}
+		ctx.args[i] = String(ctx.args[i]);
+	}
+	assertEvalAllowed(client);
 	const stringifiedFunction = ctx.call().toString();
 
 	// TODO: also check if the function comes from a weird realm. if so we need to completely block it or do something else weird
@@ -14,7 +28,9 @@ function rewriteFunction<T extends string, U extends "construct" | "apply">(
 		`return ${stringifiedFunction}`,
 		"(function proxy)",
 		client.context,
-		client.meta
+		client.meta,
+		false,
+		client
 	);
 	ctx.return(ctx.fn(content)());
 }
@@ -31,24 +47,11 @@ export default function (client: ScramjetClient, _self: Self) {
 
 	client.Proxy("Function", handler);
 
-	const RawFunction = client.natives.call(
-		"eval",
-		null,
-		"(function () {})"
-	).constructor;
-	const RawAsyncFunction = client.natives.call(
-		"eval",
-		null,
-		"(async function () {})"
-	).constructor;
-	const RawGeneratorFunction = client.natives.call(
-		"eval",
-		null,
-		"(function* () {})"
-	).constructor;
-	const RawAsyncGeneratorFunction = client.natives.call(
-		"eval",
-		null,
+	const nWindow = new client.native.window(client.global);
+	const RawFunction = nWindow.eval("(function () {})").constructor;
+	const RawAsyncFunction = nWindow.eval("(async function () {})").constructor;
+	const RawGeneratorFunction = nWindow.eval("(function* () {})").constructor;
+	const RawAsyncGeneratorFunction = nWindow.eval(
 		"(async function* () {})"
 	).constructor;
 

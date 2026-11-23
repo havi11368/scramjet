@@ -11,24 +11,41 @@ import {
 	ScramjetFetchResponse,
 } from ".";
 import { rewriteUrl, unrewriteBlob, unrewriteUrl } from "@rewriters/url";
-import { QP, parseRequest } from "./parse";
+import {
+	QP,
+	type QueryParamKey,
+	parseQueryParams,
+	parseRequest,
+} from "./parse";
 import { ScramjetHeaders } from "@/shared";
 import { isDocument, isRedirect, normalizeContentType } from "./util";
 import { rewriteBody } from "./body";
 import { Tap } from "@/Tap";
 import {
 	computeFetchSite,
+	determineReferrer,
+	resolveFetchInitiatorUrl,
 	rewriteRequestHeaders,
+	attachCarriedHeaders,
 	rewriteResponseHeaders,
 	worstFetchSite,
+	registrableDomain,
 } from "./headers";
-import { _URL } from "@/shared/snapshot";
+import { Object_keys, _URL, URL_revokeObjectURL } from "@/shared/snapshot";
+import {
+	acceptClientHints,
+	hintsReachable,
+	isTopLevelNavigation,
+	needsCriticalRestart,
+	readyClientHints,
+} from "./clienthints";
 
 export async function doHandleFetch(
 	handler: ScramjetFetchHandler,
 	request: ScramjetFetchRequest
 ): Promise<ScramjetFetchResponse> {
 	const parsed = parseRequest(request, handler);
+	parsed.referrer = determineReferrer(handler, request, parsed);
 
 	if (isBlobOrDataUrl(parsed.url)) {
 		return handleBlobOrDataUrlFetch(handler, request, parsed);
@@ -49,10 +66,25 @@ export async function doHandleFetch(
 	}
 
 	if (parsed.hadExtraParams && isDocument(parsed)) {
-		const location = rewriteUrl(parsed.url, handler.context, parsed.meta);
-		if (location !== request.rawUrl.href) {
+		// the same navigation over again, with the form's fields folded into the
+		// URL. its parameters are the ones it came with, not ones worked out
+		// from this document, which is only the destination; and the browser
+		// follows it with the referrer it sent here, which this hop has already
+		// made sense of and the next could not - the fields took the place of
+		// whatever the page stamped on the form's URL
+		const location = new _URL(
+			rewriteUrl(parsed.url, handler.context, parsed.meta)
+		);
+		location.search = "";
+		const { params } = parseQueryParams(request.rawUrl.searchParams);
+		for (const key of Object_keys(params) as QueryParamKey[]) {
+			location.searchParams.set(QP[key], params[key]!);
+		}
+		location.searchParams.set(QP.referrerSource, parsed.referrer ?? "");
+
+		if (location.href !== request.rawUrl.href) {
 			const responseHeaders = new ScramjetHeaders();
-			responseHeaders.set("location", location);
+			responseHeaders.set("location", location.href);
 			return {
 				body: "",
 				headers: responseHeaders,
@@ -62,23 +94,43 @@ export async function doHandleFetch(
 		}
 	}
 
-	const newheaders = rewriteRequestHeaders(request, handler, parsed);
+	// Before the headers are composed, not after: a hint that is not resolved
+	// yet is a hint that silently does not get sent, on whichever request
+	// happens to be first -- which on a challenge page is the one that decides
+	// what the rest of the journey looks like.
+	await readyClientHints();
+	let newheaders = rewriteRequestHeaders(request, handler, parsed);
 
 	let responseBody: BodyType;
-	const response = await doNetworkFetch(handler, request, parsed, newheaders);
+	let response = await doNetworkFetch(handler, request, parsed, newheaders);
+
+	// Only a top-level navigation's `Accept-CH` is kept, and only one fetched
+	// with GET or HEAD is restarted over `Critical-CH` - Chrome restarts
+	// nothing else, and a body could not be sent again anyway: its stream has
+	// been read. Once, and only once: the server is saying it cannot act on
+	// the request it was given, so the response is dropped and the request
+	// reissued with the hints it named. A Cloudflare managed challenge answers
+	// its first navigation this way.
+	if (isTopLevelNavigation(parsed) && hintsReachable(parsed.url)) {
+		const first = ScramjetHeaders.fromRawHeaders(response.rawHeaders);
+		acceptClientHints(parsed.url, first);
+		if (
+			(request.method === "GET" || request.method === "HEAD") &&
+			needsCriticalRestart(first, newheaders)
+		) {
+			// what the dropped response set is sent with its retry
+			await handleCookies(handler, request, parsed, response.rawHeaders);
+			newheaders = rewriteRequestHeaders(request, handler, parsed);
+			response = await doNetworkFetch(handler, request, parsed, newheaders);
+			acceptClientHints(
+				parsed.url,
+				ScramjetHeaders.fromRawHeaders(response.rawHeaders)
+			);
+		}
+	}
 
 	// set-cookie needs to take the raw headers. after this, we can flatten the headers into a ScramjetHeaders object
 	await handleCookies(handler, request, parsed, response.rawHeaders);
-
-	if (isDocument(parsed)) {
-		// for document.referer
-		parsed.trackedClient?.history.push({
-			url: parsed.url.href,
-			refererPolicy: ScramjetHeaders.fromRawHeaders(response.rawHeaders).get(
-				"referrer-policy"
-			),
-		});
-	}
 
 	const responseHeaders = await rewriteResponseHeaders(
 		handler,
@@ -89,30 +141,14 @@ export async function doHandleFetch(
 
 	if (isRedirect(response)) {
 		const location = new _URL(responseHeaders.get("location"));
-		const referer = newheaders.get("Referer");
 
-		// Compute the page (initiator) URL once. The initiator never changes
-		// through a redirect chain, so prefer the propagated `sj$io` value if
-		// the chain has already started; otherwise fall back to rawClientUrl
-		// or rawReferrer (which point at the page for the *first* hop).
-		let initiatorOriginUrl: URL | undefined;
-		if (parsed.fetchInitiatorOrigin) {
-			try {
-				initiatorOriginUrl = new URL(parsed.fetchInitiatorOrigin);
-			} catch {
-				initiatorOriginUrl = undefined;
-			}
-		}
-		if (!initiatorOriginUrl) {
-			const rawClient =
-				request.rawClientUrl ||
-				(request.rawReferrer ? new URL(request.rawReferrer) : undefined);
-			initiatorOriginUrl =
-				rawClient &&
-				rawClient.pathname.startsWith(handler.context.prefix.pathname)
-					? new URL(unrewriteUrl(rawClient, handler.context))
-					: undefined;
-		}
+		// the initiator never changes through a redirect chain, and is handed on
+		// as `$io` for the hops where the browser no longer says who it was
+		const initiatorOriginUrl = resolveFetchInitiatorUrl(
+			request,
+			parsed,
+			handler
+		);
 
 		// Cross-site redirect poisoning (SameSite): if this hop was cross-site, or a
 		// previous hop already was, propagate the flag so the final destination
@@ -120,8 +156,8 @@ export async function doHandleFetch(
 		const crossSiteRedirect =
 			parsed.crossSiteRedirect ||
 			(!!initiatorOriginUrl &&
-				registrableDomainForRedirect(initiatorOriginUrl.hostname) !==
-					registrableDomainForRedirect(parsed.url.hostname));
+				registrableDomain(initiatorOriginUrl.hostname) !==
+					registrableDomain(parsed.url.hostname));
 
 		// Sec-Fetch-Site chain state: combine the worst classification seen so
 		// far with the relation between the initiator and *this* hop's URL.
@@ -137,13 +173,25 @@ export async function doHandleFetch(
 			}
 		}
 
-		location.searchParams.set(QP.referrerSource, referer ?? "");
+		// the browser follows the redirect with the whole referrer, since in the
+		// proxy's URL space it has not left the origin. hand on the one this hop
+		// actually sent, which is all the next hop may start from
+		location.searchParams.set(QP.referrerSource, parsed.referrer ?? "");
+		if (isDocument(parsed)) {
+			location.searchParams.set(
+				QP.referrerPolicy,
+				parsed.initialReferrerPolicy ?? request.rawReferrerPolicy ?? ""
+			);
+		}
 		if (crossSiteRedirect) location.searchParams.set(QP.crossSiteRedirect, "1");
+
 		if (propagatedFetchSite)
 			location.searchParams.set(QP.fetchSite, propagatedFetchSite);
 		if (initiatorOriginUrl)
 			location.searchParams.set(QP.initiatorOrigin, initiatorOriginUrl.origin);
 		if (parsed.isModule) location.searchParams.set(QP.isModule, "module");
+		// a frame is still a frame after its redirect
+		if (parsed.isIframe) location.searchParams.set(QP.isIframe, "1");
 
 		responseHeaders.set("location", location.href);
 	}
@@ -266,6 +314,9 @@ async function handleBlobOrDataUrlFetch(
 		);
 	}
 	const headers = ScramjetHeaders.fromRawHeaders(response.rawHeaders);
+	// carried before the normalisation and the isolation headers below, so the
+	// page reads back what the blob or data URL actually declared
+	attachCarriedHeaders(headers, response.rawHeaders);
 
 	// blob urls actually *can* set charsets, so we need to normalize them if it goes down the html path
 	normalizeContentType(parsed, headers);
@@ -275,7 +326,7 @@ async function handleBlobOrDataUrlFetch(
 		headers.set("Cross-Origin-Embedder-Policy", "require-corp");
 	}
 
-	if (parsed.isFakeDataURL) URL.revokeObjectURL(dataUrl);
+	if (parsed.isFakeDataURL) URL_revokeObjectURL(dataUrl);
 
 	return {
 		body,
@@ -283,16 +334,6 @@ async function handleBlobOrDataUrlFetch(
 		statusText: response.statusText,
 		headers: headers,
 	};
-}
-
-/** Simplified registrable-domain check used for cross-site redirect detection. */
-export function registrableDomainForRedirect(hostname: string): string {
-	if (/^[\d.]+$/.test(hostname) || hostname.includes(":")) return hostname;
-	const labels = hostname.split(".");
-	if (labels.length <= 1) return hostname;
-	if (labels[0] === "www") return labels.slice(1).join(".");
-	if (labels.length === 2) return hostname;
-	return labels.slice(-2).join(".");
 }
 
 async function handleCookies(

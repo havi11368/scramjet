@@ -28,14 +28,14 @@ addEventListener("message", (e) => {
 	) {
 		const { port, prefix } = e.data.$sw$initRemoteTransport;
 
-		const relevantcontroller = tabs.find((tab) =>
-			new URL(prefix).pathname.startsWith(tab.prefix)
-		);
-		if (!relevantcontroller) {
-			console.error("No relevant controller found for transport init");
-			return;
-		}
-		relevantcontroller.rpc.call("initRemoteTransport", port, [port]);
+		const pending = findTabForPath(new URL(prefix).pathname).then((tab) => {
+			if (!tab) {
+				console.error("No relevant controller found for transport init");
+				return;
+			}
+			tab.rpc.call("initRemoteTransport", port, [port]);
+		});
+		(e as ExtendableMessageEvent).waitUntil(pending);
 	}
 });
 
@@ -141,7 +141,69 @@ class ControllerReference {
 	}
 }
 
+// tab registrations only live in memory, so they vanish whenever the browser
+// stops this worker. routing therefore keys off the prefix in the url, and a
+// request for a tab we don't know about asks the owning page to reconnect and
+// waits for it instead of falling through to the network.
+//
+// the prefix is whatever the page configured, so it can't be baked in here.
+// every controller reports its prefix on init, and the worker keeps the set it
+// has seen in cache storage, which (unlike the worker's memory) survives the
+// worker being stopped.
+export const config = {
+	reviveTimeout: 10000,
+};
+
+const PREFIX_CACHE = "$controller$sw";
+const PREFIX_KEY = new URL("/$controller$/prefixes", location.origin).href;
+
+let knownPrefixes: string[] = [];
+let prefixesLoaded = false;
+const prefixesReady: Promise<void> = (async () => {
+	try {
+		const cache = await caches.open(PREFIX_CACHE);
+		const res = await cache.match(PREFIX_KEY);
+		if (res) {
+			const stored = await res.json();
+			if (Array.isArray(stored)) {
+				for (const prefix of stored) {
+					if (typeof prefix === "string") addPrefix(prefix);
+				}
+			}
+		}
+	} catch (e) {
+		console.error("failed to load stored controller prefixes", e);
+	} finally {
+		prefixesLoaded = true;
+	}
+})();
+
+function addPrefix(prefix: string): boolean {
+	if (!prefix || knownPrefixes.includes(prefix)) return false;
+	knownPrefixes.push(prefix);
+	// longest first, so a nested prefix wins over the one containing it
+	knownPrefixes.sort((a, b) => b.length - a.length);
+	return true;
+}
+
+async function rememberPrefix(prefix: string) {
+	await prefixesReady;
+	if (!addPrefix(prefix)) return;
+	try {
+		const cache = await caches.open(PREFIX_CACHE);
+		await cache.put(
+			PREFIX_KEY,
+			new Response(JSON.stringify(knownPrefixes), {
+				headers: { "content-type": "application/json" },
+			})
+		);
+	} catch (e) {
+		console.error("failed to store controller prefix", e);
+	}
+}
+
 const tabs: ControllerReference[] = [];
+const tabWaiters = new Map<string, Array<(tab: ControllerReference) => void>>();
 
 addEventListener("message", (e) => {
 	if (!e.data) return;
@@ -150,47 +212,161 @@ addEventListener("message", (e) => {
 	if (typeof e.data.$controller$init != "object") return;
 	const init = e.data.$controller$init;
 
+	// older controllers don't send basePrefix; their tab prefix is always
+	// `${basePrefix}${id}/`, so it can be recovered from that
+	let basePrefix: string | undefined = init.basePrefix;
+	if (typeof basePrefix !== "string" && init.prefix.endsWith(init.id + "/")) {
+		basePrefix = init.prefix.slice(0, -(init.id.length + 1));
+	}
+	if (basePrefix) {
+		(e as ExtendableMessageEvent).waitUntil(rememberPrefix(basePrefix));
+	}
+
 	const existing = tabs.findIndex((t) => t.id === init.id);
 	if (existing !== -1) {
 		tabs.splice(existing, 1);
 	}
-	tabs.push(new ControllerReference(init.prefix, init.id, e.ports[0]));
+	const tab = new ControllerReference(init.prefix, init.id, e.ports[0]);
+	tabs.push(tab);
+
+	const waiters = tabWaiters.get(init.id);
+	if (waiters) {
+		tabWaiters.delete(init.id);
+		for (const resolve of waiters) resolve(tab);
+	}
 });
 
+function tabIdFromPath(pathname: string): string | null {
+	const prefix = knownPrefixes.find((p) => pathname.startsWith(p));
+	if (!prefix) return null;
+	const id = pathname.slice(prefix.length).split("/")[0];
+	return id || null;
+}
+
+async function findTabForPath(
+	pathname: string
+): Promise<ControllerReference | undefined> {
+	const tab = tabs.find((tab) => pathname.startsWith(tab.prefix));
+	if (tab) return tab;
+
+	await prefixesReady;
+	const id = tabIdFromPath(pathname);
+	if (!id) return undefined;
+
+	return new Promise((resolve) => {
+		let waiters = tabWaiters.get(id);
+		const first = !waiters;
+		if (!waiters) {
+			waiters = [];
+			tabWaiters.set(id, waiters);
+		}
+
+		const timeout = setTimeout(() => {
+			const list = tabWaiters.get(id);
+			if (list) {
+				const idx = list.indexOf(onTab);
+				if (idx !== -1) list.splice(idx, 1);
+				if (list.length === 0) tabWaiters.delete(id);
+			}
+			resolve(undefined);
+		}, config.reviveTimeout);
+		const onTab = (tab: ControllerReference) => {
+			clearTimeout(timeout);
+			resolve(tab);
+		};
+		waiters.push(onTab);
+
+		if (first) requestRevive(id);
+	});
+}
+
+async function requestRevive(id: string) {
+	const all = await self.clients.matchAll({ includeUncontrolled: true });
+	for (const client of all) {
+		client.postMessage({
+			$controller$swrevive: { id },
+		});
+	}
+}
+
 export function shouldRoute(event: FetchEvent): boolean {
+	// respondWith has to be called synchronously, but the stored prefixes are
+	// read asynchronously. a fetch that wakes a stopped worker lands before
+	// they are back, so until then claim everything and let route() pass
+	// through whatever turns out not to be ours.
+	if (!prefixesLoaded) return true;
 	const url = new URL(event.request.url);
-	const tab = tabs.find((tab) => url.pathname.startsWith(tab.prefix));
-	return tab !== undefined;
+	if (tabIdFromPath(url.pathname)) return true;
+	return tabs.some((tab) => url.pathname.startsWith(tab.prefix));
 }
 
 export async function route(event: FetchEvent): Promise<Response> {
 	try {
 		const url = new URL(event.request.url);
-		const tab = tabs.find((tab) => url.pathname.startsWith(tab.prefix))!;
+		const tab = await findTabForPath(url.pathname);
+		if (!tab && !tabIdFromPath(url.pathname)) {
+			// only reachable for requests claimed before the prefixes loaded
+			return fetch(event.request);
+		}
+		if (!tab) {
+			return new Response(
+				"Proxy controller for this page is gone; reload the proxy page.",
+				{ status: 503, headers: { "content-type": "text/plain" } }
+			);
+		}
 		const client = await clients.get(event.clientId);
 
 		const rawheaders: RawHeaders = [...event.request.headers];
+
+		// The body as BYTES, so the transport knows how long it is.
+		//
+		// `event.request.body` is a ReadableStream whatever the page passed --
+		// a service worker sees every body that way, even the string an XHR
+		// sent -- and a transport handed a stream cannot say how many bytes are
+		// coming. epoxy therefore framed it as `transfer-encoding: chunked` on
+		// HTTP/1.1 and with no length at all on HTTP/2, where Chromium sends
+		// `content-length` on every POST that is not an explicit
+		// `duplex: "half"` upload, third in the framing block:
+		//
+		//     Host, Connection, Content-Length, Cache-Control, sec-ch-ua, ...
+		//
+		// The fix cannot be to copy the header across: `content-length` is a
+		// forbidden header name in fetch, so the shim can never read the one
+		// the page sent. It does not have to -- reading the body gives the same
+		// number, and a transport given bytes rather than a stream frames the
+		// length itself.
+		//
+		// The cost is that an upload is no longer streamed. That is also what
+		// Chromium does for every body except a `duplex: "half"` stream, which
+		// a service worker cannot distinguish anyway.
+		//
+		// `null` stays `null`. A bodyless GET handed a zero-length buffer is
+		// not the same request -- the transport then sends a body on something
+		// that must not have one, and epoxy refuses the very first GET.
+		const requestBody = event.request.body
+			? await event.request.arrayBuffer()
+			: null;
 
 		const response = await tab.rpc.call(
 			"request",
 			{
 				rawUrl: event.request.url,
 				rawReferrer: event.request.referrer,
+				rawReferrerPolicy: event.request.referrerPolicy,
 				destination: event.request.destination,
 				mode: event.request.mode,
 				referrer: event.request.referrer,
 				method: event.request.method,
-				body: event.request.body,
+				body: requestBody,
 				cache: event.request.cache,
 				forceCrossOriginIsolated: false,
 				initialHeaders: rawheaders,
 				rawClientUrl: client ? client.url : undefined,
 				clientId: event.clientId || event.resultingClientId,
 			},
-			event.request.body instanceof ReadableStream ||
-				// @ts-expect-error the types for fetchevent are messed up
-				event.request.body instanceof ArrayBuffer
-				? [event.request.body]
+			requestBody instanceof ReadableStream ||
+				requestBody instanceof ArrayBuffer
+				? [requestBody]
 				: undefined
 		);
 
@@ -201,12 +377,23 @@ export async function route(event: FetchEvent): Promise<Response> {
 		});
 	} catch (e) {
 		console.error("Service Worker error:", e);
-		return new Response(
-			"Internal Service Worker Error: " + (e as Error).message,
-			{
-				status: 500,
-			}
-		);
+		// A network error, not a 500. When a request cannot be made at all --
+		// DNS does not resolve, the handshake dies, the transport is gone -- a
+		// browser produces no response and the fetch rejects. Answering with a
+		// status turns "could not reach the server" into "the server said
+		// something", which is a thing no browser does and a difference the
+		// page can read.
+		//
+		// Cloudflare's challenge reads exactly this. It probes
+		// `brunhild.challenges.cloudflare.com`, which resolves nowhere for
+		// anyone, and records HOW the request failed: a direct load reports
+		// `fetch_error`, where answering from here reported `http_error:500`.
+		// The probe exists to be failed; what it grades is the shape of the
+		// failure.
+		//
+		// The error is still logged above, so an internal bug stays as visible
+		// to whoever is debugging as it ever was -- just not to the page.
+		return Response.error();
 	}
 }
 
@@ -217,15 +404,3 @@ addEventListener("install", () => {
 addEventListener("activate", (event: ExtendableEvent) => {
 	event.waitUntil(clients.claim());
 });
-
-// the only way to know if a service worker has suddenly died is if this code runs again
-// notify all clients to send over their messageports again
-setTimeout(async () => {
-	console.log("service worker activated, notifying clients to revive");
-	for (const client of await clients.matchAll()) {
-		client.postMessage({
-			$controller$swrevive: {},
-		});
-	}
-	// short delay is apparently needed
-}, 100);

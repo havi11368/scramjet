@@ -3,8 +3,9 @@
 // the entry point for scramjet.all.js (what most sites wil use) is entry.ts
 
 import "./global.d";
-import { atob } from "@/shared/snapshot";
+import { atob, _Uint8Array } from "@/shared/snapshot";
 import { setWasm } from "@rewriters/wasm";
+import { pstAvailable } from "@/shared/incumbency";
 import { ScramjetVersionInfo, ScramjetConfig } from "./types";
 
 declare const VERSION: string;
@@ -21,14 +22,18 @@ export const defaultConfig: ScramjetConfig = {
 		wrapfn: "$scramjet$wrap",
 		wrappropertybase: "$scramjet__",
 		wrappropertyfn: "$scramjet$prop",
+		callfn: "$scramjet$call",
 		cleanrestfn: "$scramjet$clean",
 		importfn: "$scramjet$import",
 		rewritefn: "$scramjet$rewrite",
 		metafn: "$scramjet$meta",
-		wrappostmessagefn: "$scramjet$wrappostmessage",
 		pushsourcemapfn: "$scramjet$pushsourcemap",
+		registerrealmfn: "$scramjet$registerrealm",
+		standinfn: "$scramjet$standin",
 		trysetfn: "$scramjet$tryset",
 		templocid: "$scramjet$temploc",
+		tempreceiverid: "$scramjet$tempreceiver",
+		tempcalleeid: "$scramjet$tempcallee",
 		tempunusedid: "$scramjet$tempunused",
 	},
 	flags: {
@@ -36,17 +41,15 @@ export const defaultConfig: ScramjetConfig = {
 		disableComputedWrap: false,
 		rewriterLogs: false,
 		captureErrors: false,
-		cleanErrors: false,
-		scramitize: false,
+		cleanErrors: true,
 		sourcemaps: true,
 		destructureRewrites: true,
 		allowInvalidJs: true,
 		debugTrampolines: false,
-		allowFailedIntercepts: false,
 		encapsulateWorkers: true,
 		debugSourceURL: false,
+		incumbency: pstAvailable ? "pst" : "lazystamp",
 	},
-	siteFlags: {},
 	maskedfiles: [],
 };
 
@@ -66,7 +69,7 @@ export const defaultConfigDev: ScramjetConfig = {
 declare const REWRITERWASM: string | undefined;
 // bundled build will have the wasm binary inlined as a base64 string
 if (REWRITERWASM) {
-	setWasm(Uint8Array.from(atob(REWRITERWASM), (c) => c.charCodeAt(0)));
+	setWasm(_Uint8Array.from(atob(REWRITERWASM), (c) => c.charCodeAt(0)));
 }
 
 export * from "./symbols";

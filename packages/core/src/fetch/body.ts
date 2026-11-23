@@ -15,7 +15,12 @@ import {
 	rewriteWorkers,
 } from "@/shared";
 import { sniffEncoding } from "@/shared/sniffEncoding";
-import { _TextDecoder } from "@/shared/snapshot";
+import { documentReferrer } from "./headers";
+import {
+	TextDecoder_decode,
+	_TextDecoder,
+	_Uint8Array,
+} from "@/shared/snapshot";
 
 export async function rewriteBody(
 	handler: ScramjetFetchHandler,
@@ -28,7 +33,7 @@ export async function rewriteBody(
 		case "document":
 			if (isHtmlMimeType(response.headers.get("content-type") ?? "")) {
 				const buf = await response.arrayBuffer();
-				const bytes = new Uint8Array(buf);
+				const bytes = new _Uint8Array(buf);
 				const encoding = sniffEncoding(
 					bytes,
 					response.headers.get("content-type")
@@ -40,8 +45,7 @@ export async function rewriteBody(
 					inline: true,
 					source: parsed.url.href,
 					headers: response.rawHeaders,
-					// reasonably confident that a document fetch is impossible without a client
-					history: parsed.trackedClient!.history,
+					referrer: documentReferrer(parsed),
 				});
 			} else {
 				return response.body;
@@ -56,18 +60,16 @@ export async function rewriteBody(
 				}
 
 				let rewritten = rewriteJs(
-					new Uint8Array(await response.arrayBuffer()),
+					new _Uint8Array(await response.arrayBuffer()),
 					response.url,
 					handler.context,
 					parsed.meta,
 					parsed.isModule
 				);
 
-				if (
-					flagEnabled("debugSourceURL", handler.context, parsed.meta.origin)
-				) {
-					if (rewritten instanceof Uint8Array) {
-						rewritten = new TextDecoder().decode(rewritten);
+				if (flagEnabled("debugSourceURL", handler.context)) {
+					if (typeof rewritten !== "string") {
+						rewritten = TextDecoder_decode(rewritten);
 					}
 					rewritten += `\n//# sourceURL=${parsed.url.href}`;
 				}
@@ -81,7 +83,7 @@ export async function rewriteBody(
 		case "sharedworker":
 		case "worker":
 			return rewriteWorkers(
-				new Uint8Array(await response.arrayBuffer()),
+				new _Uint8Array(await response.arrayBuffer()),
 				response.url,
 				handler.context,
 				parsed.meta,

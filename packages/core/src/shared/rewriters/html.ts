@@ -1,27 +1,38 @@
-import { ElementType, Parser } from "htmlparser2";
-import { ChildNode, DomHandler, Element, Comment } from "domhandler";
-import render from "dom-serializer";
-import { URLMeta, rewriteUrl } from "@rewriters/url";
-import { rewriteCss } from "@rewriters/css";
+import {
+	type AnyNode,
+	type CDATA,
+	type ChildNode,
+	type Document,
+	DomBuilder,
+	Element,
+	ElementType,
+	Parser,
+	parseDocument,
+	render,
+} from "@/shared/htmlparser";
+import { type NullArray, nullArray } from "@/shared/htmlparser/safe";
+import { URLMeta, frozenBaseUrl, rewriteUrl } from "@rewriters/url";
+import { rewriteCss, unrewriteCss } from "@rewriters/css";
 import { rewriteJs } from "@rewriters/js";
+import { rewriteImportMap } from "@rewriters/importmap";
 import { ScramjetContext } from "@/shared";
 import { htmlRules } from "@/shared/htmlRules";
-import { parseDeclarativeRefresh } from "@/shared/refresh";
-import { bytesToBase64 } from "@/shared/util";
+import { base64Decode, bytesToBase64 } from "@/shared/util";
 import { Tap } from "@/Tap";
 import { RawHeaders } from "@mercuryworkshop/proxy-transports";
-import { TrackedHistoryState } from "@/fetch";
 import {
+	Error,
 	Performance_now,
-	atob,
-	Object_entries,
-	JSON_parse,
-	JSON_stringify,
+	Object_getOwnPropertyDescriptor,
+	Object_keys,
 	TextEncoder_encode,
-	Array_from,
-	String_fromCodePoint,
-	btoa,
+	Array_indexOf,
+	String_slice,
+	String_startsWith,
+	String_toLowerCase,
+	String_trim,
 	_URL,
+	_WeakSet,
 } from "@/shared/snapshot";
 import { flagEnabled } from "..";
 import {
@@ -31,6 +42,63 @@ import {
 } from "@/shared/mime";
 
 export type ForeignContext = "svg" | "math" | "html";
+
+/**
+ * Where a script element's original source is kept, in base64.
+ *
+ * Under the prefix every internal attribute shares, so it is hidden like the
+ * rest - but not under the `scramjet-attr-` a mirror is named with. As
+ * `scramjet-attr-script-source-src` it was also the mirror of a page's own
+ * `script-source-src` attribute, and every lookup of that name found the
+ * source instead.
+ */
+export const SCRIPT_SOURCE_ATTRIBUTE = "scramjet-attr_script-source";
+
+/** The name the mirror of `attr` is kept under. */
+const mirrorName = (attr: string) => `scramjet-attr-${attr}`;
+
+// Initialized on first rewrite because htmlRules imports rewriteHtml from this
+// module. Keep rule order, but avoid enumerating every rule for every element.
+let ruleAttributeNames: string[][] | undefined;
+function getRuleAttributeNames(): string[][] {
+	if (ruleAttributeNames) return ruleAttributeNames;
+	const all: string[][] = [];
+	for (let i = 0; i < htmlRules.length; i++) {
+		const names = Object_keys(htmlRules[i]);
+		const attributes: string[] = [];
+		for (let j = 0; j < names.length; j++) {
+			if (names[j] !== "fn") attributes[attributes.length] = names[j];
+		}
+		all[i] = attributes;
+	}
+	ruleAttributeNames = all;
+	return all;
+}
+
+/**
+ * Put `to` where `from` is in an element's attribute list.
+ *
+ * An attribute a rule removes leaves its mirror to represent it, and the page
+ * reads the list back in the order the parser gave it - so the mirror takes
+ * the removed attribute's place rather than joining the end.
+ */
+function replaceAttribute(
+	attribs: Record<string, string>,
+	from: string,
+	to: string,
+	value: string
+) {
+	const keys = Object_keys(attribs);
+	const values: string[] = [];
+	for (let i = 0; i < keys.length; i++) {
+		values[i] = attribs[keys[i]];
+		delete attribs[keys[i]];
+	}
+	for (let i = 0; i < keys.length; i++) {
+		if (keys[i] === from) attribs[to] = value;
+		else if (keys[i] !== to) attribs[keys[i]] = values[i];
+	}
+}
 
 export type HtmlContext = {
 	// should we inject scramjet scripts at the top of the document?
@@ -44,31 +112,26 @@ export type HtmlContext = {
 	// response headers for worker originating documents
 	headers?: RawHeaders;
 	foreignContext?: ForeignContext;
-	history?: TrackedHistoryState[];
+	// XML MIME types use the XML tokenizer and serializer, while sharing the
+	// attribute rewriting rules with HTML documents.
+	xmlMode?: boolean;
+	// `DOMParser`'s HTML parser has scripting disabled, which changes how it
+	// treats `noscript` content.
+	scriptingEnabled?: boolean;
+	/**
+	 * document.referrer for the document being rewritten, when it is one the
+	 * proxy served. Documents it never saw, like srcdoc, have none.
+	 */
+	referrer?: string;
 };
-
-const renderOptions = {
-	encodeEntities: "utf8" as const,
-	decodeEntities: false,
-};
-function serializeHtmlNode(node: ChildNode) {
-	return render(node, renderOptions);
-}
-
-function isElementNode(node: ChildNode): node is Element {
-	return (
-		node.type === ElementType.Tag ||
-		node.type === ElementType.Script ||
-		node.type === ElementType.Style
-	);
-}
 
 export class IncrementalHtmlRewriter {
-	private readonly handler: DomHandler;
+	private readonly builder = new DomBuilder();
 	private readonly parser: Parser;
-	private readonly completedElements = new WeakSet<Element>();
-	private readonly emittedLengths = new WeakMap<ChildNode, number>();
-	private readonly rewrittenNodes = new WeakMap<ChildNode, string>();
+	/** Per child of the root, by index: how much of its output went out. */
+	private readonly emittedLengths: NullArray<number> = nullArray();
+	/** Per child of the root, by index: its rewrite, once it is complete. */
+	private readonly rewrittenNodes: NullArray<string> = nullArray();
 	private ended = false;
 
 	constructor(
@@ -76,11 +139,9 @@ export class IncrementalHtmlRewriter {
 		private readonly meta: URLMeta,
 		private readonly htmlcontext: HtmlContext
 	) {
-		this.handler = new DomHandler(undefined, undefined, (element) => {
-			this.completedElements.add(element);
-		});
-		this.parser = new Parser(this.handler, {
+		this.parser = new Parser(this.builder, {
 			startingForeignContext: htmlcontext.foreignContext,
+			xmlMode: htmlcontext.xmlMode,
 		});
 	}
 
@@ -110,34 +171,38 @@ export class IncrementalHtmlRewriter {
 	}
 
 	private flush() {
+		const { children } = this.builder.root;
 		let output = "";
 
-		for (const node of this.handler.root.childNodes) {
-			const rewritten = this.getAvailableOutput(node);
+		for (let index = 0; index < children.length; index++) {
+			const rewritten = this.getAvailableOutput(children, index);
 			if (rewritten === null) {
 				break;
 			}
 
-			const emittedLength = this.emittedLengths.get(node) ?? 0;
+			const emittedLength = this.emittedLengths[index] ?? 0;
 			if (rewritten.length > emittedLength) {
-				output += rewritten.slice(emittedLength);
-				this.emittedLengths.set(node, rewritten.length);
+				output += String_slice(rewritten, emittedLength);
+				this.emittedLengths[index] = rewritten.length;
 			}
 		}
 
 		return output;
 	}
 
-	private getAvailableOutput(node: ChildNode) {
-		if (!isElementNode(node)) {
-			return serializeHtmlNode(node);
+	private getAvailableOutput(children: NullArray<ChildNode>, index: number) {
+		const node = children[index];
+		if (node.type !== ElementType.Tag) {
+			return render(node);
 		}
 
-		if (!this.completedElements.has(node)) {
+		// Only the last child of the root can still be open: anything after it
+		// was added once the parser was back at the top level.
+		if (index === children.length - 1 && this.builder.openElements > 0) {
 			return null;
 		}
 
-		let rewritten = this.rewrittenNodes.get(node);
+		let rewritten = this.rewrittenNodes[index];
 		if (rewritten === undefined) {
 			rewritten = rewriteHtmlInner(
 				node,
@@ -145,11 +210,23 @@ export class IncrementalHtmlRewriter {
 				this.meta,
 				this.htmlcontext
 			);
-			this.rewrittenNodes.set(node, rewritten);
+			this.rewrittenNodes[index] = rewritten;
 		}
 
 		return rewritten;
 	}
+}
+
+/** ASCII whitespace, which the parser skips ahead of the doctype. */
+function isParserWhitespace(data: string): boolean {
+	for (let i = 0; i < data.length; i++) {
+		const c = data[i];
+		if (c !== " " && c !== "\t" && c !== "\n" && c !== "\f" && c !== "\r") {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 function rewriteHtmlInner(
@@ -159,34 +236,34 @@ function rewriteHtmlInner(
 	htmlcontext: HtmlContext
 ) {
 	if (typeof html !== "string") {
-		html = serializeHtmlNode(html);
+		html = render(html);
 	}
 
-	const handler = new DomHandler((err, dom) => dom);
-	const parser = new Parser(handler, {
+	const root = parseDocument(html, {
 		startingForeignContext: htmlcontext.foreignContext,
+		xmlMode: htmlcontext.xmlMode,
+		scriptingEnabled: htmlcontext.scriptingEnabled,
 	});
 
-	parser.write(html);
-	parser.end();
 	Tap.dispatch(
 		context.hooks!.rewriter.html.pre,
 		{
-			handler,
+			root,
 			meta,
 			htmlcontext,
 			origHtml: html,
 		},
 		undefined
 	);
-	traverseParsedHtml(handler.root, context, meta);
+	traverseParsedHtml(root, context, meta);
 
 	let htmlRoot: Element | undefined;
 	let headElement: Element | undefined;
 	let bodyElement: Element | undefined;
 
 	function detectQuirks() {
-		for (const child of handler.root.childNodes) {
+		for (let index = 0; index < root.children.length; index++) {
+			const child = root.children[index];
 			if (
 				child.type === ElementType.Directive ||
 				child.type === ElementType.Comment ||
@@ -196,7 +273,7 @@ function rewriteHtmlInner(
 			}
 
 			if (child.type === ElementType.Tag && child.name === "html") {
-				htmlRoot = child as Element;
+				htmlRoot = child;
 			} else {
 				// there's a child of the root that isn't an html element or a doctype/comment/text
 				return true;
@@ -205,7 +282,8 @@ function rewriteHtmlInner(
 
 		if (!htmlRoot) return true; // no html tag or it's somewhere else other than first child
 
-		for (const child of htmlRoot.childNodes) {
+		for (let index = 0; index < htmlRoot.children.length; index++) {
+			const child = htmlRoot.children[index];
 			if (
 				child.type === ElementType.Directive ||
 				child.type === ElementType.Comment ||
@@ -219,9 +297,9 @@ function rewriteHtmlInner(
 					// head comes after body
 					return true;
 				}
-				headElement = child as Element;
+				headElement = child;
 			} else if (child.type === ElementType.Tag && child.name === "body") {
-				bodyElement = child as Element;
+				bodyElement = child;
 			} else {
 				// there's a child of html that isn't head or body
 				// fine if head already exists, bad if it doesn't
@@ -241,7 +319,7 @@ function rewriteHtmlInner(
 			new Element("script", { src, "scramjet-injected": "true" });
 		const injectScripts = context.interface.getInjectScripts(
 			meta,
-			handler,
+			root,
 			htmlcontext,
 			script
 		);
@@ -250,16 +328,46 @@ function rewriteHtmlInner(
 			dbg.warn(
 				`detected quirky document structure parsing @ ${meta.origin.href}!`
 			);
-			// there's weird stuff going on with the document that could result in page scripts being loaded before our inject scripts
-			// so inject them at position 0
-			handler.root.children.unshift(...injectScripts);
+			// Weird document structure could get page scripts loaded before our
+			// inject scripts, so they go as early as possible -- but AFTER the
+			// doctype.
+			//
+			// "Position 0" put them in front of it, and that is what made the
+			// document quirky. In the "initial" insertion mode a DOCTYPE token
+			// is consumed normally, but a start tag falls to "Anything else",
+			// which sets the Document to quirks mode before reprocessing it
+			// (HTML Standard 13.2.6.4.1). A <script> ahead of the DOCTYPE
+			// therefore guarantees BackCompat, and the detector caused the
+			// condition it is named for -- taking compatMode and every layout
+			// metric derived from it (clientHeight, scrollHeight) with it.
+			//
+			// A comment token in that mode is just inserted and the mode does
+			// not change, so leading comments are legal ahead of the doctype and
+			// are skipped too. The scripts land at the first position that is
+			// still ahead of anything the page can run.
+			let at = 0;
+			while (at < root.children.length) {
+				const node = root.children[at];
+				if (
+					node.type === ElementType.Directive ||
+					node.type === ElementType.Comment ||
+					// whitespace ahead of the doctype is dropped by the parser,
+					// and a template engine's leading newline is everywhere
+					(node.type === ElementType.Text && isParserWhitespace(node.data))
+				) {
+					at++;
+					continue;
+				}
+				break;
+			}
+			root.insertAt(at, injectScripts);
 		} else {
 			if (!headElement) {
-				headElement = new Element("head", {}, []);
-				htmlRoot.children.unshift(headElement);
+				headElement = new Element("head", {});
+				htmlRoot.prepend([headElement]);
 			}
 
-			headElement.children.unshift(...injectScripts);
+			headElement.prepend(injectScripts);
 		}
 	}
 
@@ -267,7 +375,7 @@ function rewriteHtmlInner(
 	Tap.dispatch(
 		context.hooks!.rewriter.html.post,
 		{
-			handler,
+			root,
 			meta,
 			htmlcontext,
 			origHtml: html,
@@ -279,7 +387,7 @@ function rewriteHtmlInner(
 		return props.setRawHtml;
 	}
 
-	return render(handler.root, renderOptions);
+	return render(root, htmlcontext.xmlMode);
 }
 
 export function rewriteHtml(
@@ -290,216 +398,347 @@ export function rewriteHtml(
 ) {
 	const before = Performance_now();
 	const ret = rewriteHtmlInner(html, context, meta, htmlcontext);
-	if (flagEnabled("rewriterLogs", context, meta.base)) {
+	if (flagEnabled("rewriterLogs", context)) {
 		dbg.time(meta, before, "html rewrite");
 	}
 
 	return ret;
 }
 
-// type ParseState = {
-// 	base: string;
-// 	origin?: URL;
-// };
-
-export function unrewriteHtml(html: string, foreignContext?: ForeignContext) {
-	const handler = new DomHandler((err, dom) => dom);
-	const parser = new Parser(handler, {
+/**
+ * Undo {@link rewriteHtml} over a serialization.
+ *
+ * `context` is what lets a style element's text be un-rewritten; without it the
+ * markup comes back with the rewritten stylesheet still in it, which is a
+ * difference the page can see in `innerHTML`. Every client call passes one.
+ */
+export function unrewriteHtml(
+	html: string,
+	foreignContext?: ForeignContext,
+	context?: ScramjetContext
+) {
+	const root = parseDocument(html, {
 		startingForeignContext: foreignContext,
 	});
 
-	parser.write(html);
-	parser.end();
-
-	function traverse(node: ChildNode) {
-		if ("attribs" in node) {
-			for (const key in node.attribs) {
-				if (key == "scramjet-attr-script-source-src") {
-					if (node.children[0] && "data" in node.children[0])
-						node.children[0].data = atob(node.attribs[key]);
+	function traverse(node: AnyNode) {
+		if (node.type === ElementType.Tag) {
+			const { attribs } = node;
+			const keys = Object_keys(attribs);
+			for (let index = 0; index < keys.length; index++) {
+				const key = keys[index];
+				const lower = String_toLowerCase(key);
+				if (lower === SCRIPT_SOURCE_ATTRIBUTE) {
+					const child = node.children[0];
+					if (child && "data" in child) child.data = base64Decode(attribs[key]);
+					delete attribs[key];
 					continue;
 				}
 
-				if (key.startsWith("scramjet-attr-")) {
-					node.attribs[key.slice("scramjet-attr-".length)] = node.attribs[key];
-					delete node.attribs[key];
+				// The marker put on a script the rewriter injected. It is not a
+				// mirror, so the prefix branch below never sees it: it does not
+				// start with `scramjet-attr-`. No browser has an attribute by
+				// that name and nothing outside scramjet should read it, but it
+				// survived into the serialised output, where anything
+				// fingerprinting an element by its attribute names can see it.
+				if (lower === "scramjet-injected" && node.name === "script") {
+					delete attribs[key];
+					continue;
 				}
+
+				if (String_startsWith(lower, "scramjet-attr-")) {
+					attribs[String_slice(key, "scramjet-attr-".length)] = attribs[key];
+					delete attribs[key];
+				}
+			}
+
+			// a style element has no mirror to restore from - the stylesheet is
+			// recovered by running the rewrite backwards
+			const child = node.children[0];
+			if (
+				context &&
+				node.name === "style" &&
+				child !== undefined &&
+				"data" in child
+			) {
+				child.data = unrewriteCss(child.data, context);
 			}
 		}
 
-		if ("childNodes" in node) {
-			for (const child of node.childNodes) {
-				traverse(child);
+		if ("children" in node) {
+			for (let index = 0; index < node.children.length; index++) {
+				traverse(node.children[index]);
 			}
 		}
 	}
 
-	traverse(handler.root);
+	traverse(root);
 
-	return render(handler.root, {
-		...renderOptions,
-	});
+	return render(root);
 }
 
-// i need to add the attributes in during rewriting
+/**
+ * The metas whose base URL a base element has already set.
+ *
+ * https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url -
+ * only the *first* base element with an href sets it; any later one is
+ * ignored.
+ */
+const basedMetas = new _WeakSet<URLMeta>();
+
+/**
+ * https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url -
+ * the href parsed against the document's fallback base URL, which one the
+ * browser ignores leaves in place (see `frozenBaseUrl`).
+ *
+ * Only a meta whose `base` is a plain value adopts it: that is the service
+ * worker's, describing the whole document being parsed. The client's is a
+ * getter reading the live document, which is where the base element is going
+ * - so it already answers for it once it lands, and has no setter to call.
+ */
+function adoptBaseElement(href: string, meta: URLMeta) {
+	if (basedMetas.has(meta)) return;
+
+	const desc = Object_getOwnPropertyDescriptor(meta, "base");
+	if (!desc || !desc.writable) return;
+
+	// one the browser ignores still counts as the first, and the ones after
+	// it are ignored all the same
+	basedMetas.add(meta);
+
+	const base = frozenBaseUrl(href, meta.origin);
+	if (base) meta.base = base;
+}
 
 function traverseParsedHtml(
-	node: any,
+	node: AnyNode,
 	context: ScramjetContext,
 	meta: URLMeta
-) {
-	if (node.name === "base" && node.attribs.href !== undefined) {
-		meta.base = new _URL(node.attribs.href, meta.origin);
+): AnyNode {
+	if (node.type !== ElementType.Tag) {
+		if ("children" in node) traverseChildren(node, context, meta);
+
+		return node;
 	}
 
-	if (node.attribs) {
-		for (const rule of htmlRules) {
-			for (const attr in rule) {
-				const sel = rule[attr.toLowerCase()];
-				if (typeof sel === "function") continue;
+	const { attribs } = node;
+	const ruleAttributeNames = getRuleAttributeNames();
 
-				if (sel === "*" || sel.includes(node.name)) {
-					if (node.attribs[attr] !== undefined) {
-						const value = node.attribs[attr];
-						const v = rule.fn(value, context, meta, node.attribs);
+	if (node.name === "base" && attribs.href !== undefined) {
+		adoptBaseElement(attribs.href, meta);
+	}
 
-						if (v === null) delete node.attribs[attr];
-						else {
-							node.attribs[attr] = v;
-						}
-						node.attribs[`scramjet-attr-${attr}`] = value;
-					}
+	for (let ruleIndex = 0; ruleIndex < htmlRules.length; ruleIndex++) {
+		const rule = htmlRules[ruleIndex];
+		const ruleKeys = ruleAttributeNames[ruleIndex];
+		for (let keyIndex = 0; keyIndex < ruleKeys.length; keyIndex++) {
+			const attr = ruleKeys[keyIndex];
+			// Most elements do not carry any attribute a given rule handles.
+			if (attribs[attr] === undefined) continue;
+			const sel = rule[attr];
+			if (typeof sel === "function") continue;
+
+			if (sel === "*" || Array_indexOf(sel, node.name) !== -1) {
+				const value = attribs[attr];
+				const v = rule.fn(
+					value,
+					context,
+					meta,
+					(name) => attribs[name] || null
+				);
+
+				if (v === null) {
+					replaceAttribute(attribs, attr, mirrorName(attr), value);
+				} else {
+					attribs[attr] = v;
+					attribs[mirrorName(attr)] = value;
 				}
 			}
 		}
-		for (const [attr, value] of Object_entries(node.attribs)) {
-			if (eventAttributes.includes(attr)) {
-				node.attribs[`scramjet-attr-${attr}`] = value;
-				node.attribs[attr] = rewriteJs(
-					value as string,
-					`(inline ${attr} on element)`,
-					context,
-					meta
-				);
-			}
+	}
+	const attrKeys = Object_keys(attribs);
+	for (let index = 0; index < attrKeys.length; index++) {
+		const attr = attrKeys[index];
+		if (
+			attr[0] === "o" &&
+			attr[1] === "n" &&
+			Array_indexOf(eventAttributes, attr) !== -1
+		) {
+			const value = attribs[attr];
+			attribs[mirrorName(attr)] = value;
+			attribs[attr] = rewriteJs(
+				value,
+				`(inline ${attr} on element)`,
+				context,
+				meta,
+				false,
+				undefined,
+				eventHandlerPrelude(context, node.name, attr)
+			) as string;
 		}
 	}
 
-	if (node.name === "style" && node.children[0] !== undefined)
-		node.children[0].data = rewriteCss(node.children[0].data, context, meta);
+	const text = node.children[0];
+	const hasText = text !== undefined && text.type === ElementType.Text;
+
+	if (node.name === "style" && hasText)
+		text.data = rewriteCss(text.data, context, meta);
 
 	if (
 		node.name === "script" &&
-		node.attribs.type?.toLowerCase() === "importmap" &&
-		node.children[0] !== undefined
+		attribs.type !== undefined &&
+		String_toLowerCase(attribs.type) === "importmap" &&
+		hasText
 	) {
-		const json = node.children[0].data;
+		// the page reads its own map back, and the client resolves `import()`
+		// against it - both from the source, not the rewritten map
+		attribs[SCRIPT_SOURCE_ATTRIBUTE] = bytesToBase64(
+			TextEncoder_encode(text.data)
+		);
 		try {
-			const map = JSON_parse(json);
-			if (map.imports) {
-				for (const key in map.imports) {
-					let url = map.imports[key];
-					if (typeof url === "string") {
-						url = rewriteUrl(url, context, meta, { isModule: true });
-						map.imports[key] = url;
-					}
-				}
-			}
-
-			node.children[0].data = JSON_stringify(map);
+			text.data = rewriteImportMap(text.data, context, meta);
 		} catch (e) {
 			dbg.error("Failed to parse importmap JSON:", e);
 		}
 	}
-	if (
-		node.name === "script" &&
-		node.attribs &&
-		node.children[0] !== undefined
-	) {
+	if (node.name === "script" && hasText) {
 		const scriptBlockType = getScriptBlockTypeString(
-			"type" in node.attribs ? node.attribs.type : undefined,
-			"language" in node.attribs ? node.attribs.language : undefined,
-			"type" in node.attribs,
-			"language" in node.attribs
+			"type" in attribs ? attribs.type : undefined,
+			"language" in attribs ? attribs.language : undefined,
+			"type" in attribs,
+			"language" in attribs
 		);
 		if (isScriptType(scriptBlockType)) {
-			let js = node.children[0].data;
+			let js = text.data;
 			const module = isModuleScriptType(scriptBlockType);
-			node.attribs["scramjet-attr-script-source-src"] = bytesToBase64(
-				TextEncoder_encode(js)
-			);
+			attribs[SCRIPT_SOURCE_ATTRIBUTE] = bytesToBase64(TextEncoder_encode(js));
 			const htmlcomment = /<!--[\s\S]*?-->/g;
 			js = js.replace(htmlcomment, "");
-			node.children[0].data = rewriteJs(
+			text.data = rewriteJs(
 				js,
 				"(inline script element)",
 				context,
 				meta,
 				module
-			);
+			) as string;
 		}
 	}
 
-	if (node.name === "meta" && node.attribs["http-equiv"] !== undefined) {
-		if (
-			node.attribs["http-equiv"].toLowerCase() === "content-security-policy"
-		) {
-			// just delete it. this needs to be emulated eventually but like
-			node = new Comment(node.attribs.content);
-		} else if (node.attribs["http-equiv"].toLowerCase() === "refresh") {
-			const refresh = parseDeclarativeRefresh(node.attribs.content || "");
-			if (refresh && refresh.url !== null && refresh.url.length > 0) {
-				const rewritten = rewriteUrl(refresh.url.trim(), context, meta);
-				node.attribs.content =
-					node.attribs.content.slice(0, refresh.urlStart) +
-					rewritten +
-					node.attribs.content.slice(refresh.urlEnd);
-			}
-		}
-	}
-
-	if (node.childNodes) {
-		for (const childNode in node.childNodes) {
-			node.childNodes[childNode] = traverseParsedHtml(
-				node.childNodes[childNode],
-				context,
-				meta
-			);
-		}
-	}
+	traverseChildren(node, context, meta);
 
 	return node;
 }
 
+function traverseChildren(
+	node: Document | Element | CDATA,
+	context: ScramjetContext,
+	meta: URLMeta
+) {
+	for (let index = 0; index < node.children.length; index++) {
+		const child = node.children[index];
+		const rewritten = traverseParsedHtml(child, context, meta);
+		if (rewritten !== child) node.replaceChild(index, rewritten as ChildNode);
+	}
+}
+
+/**
+ * https://html.spec.whatwg.org/multipage/images.html#parse-a-srcset-attribute
+ *
+ * A candidate's URL runs to the next whitespace, commas and all - CDN image
+ * URLs carry them (`…_SX300,QL70_.jpg 2x`) - and its descriptors run to the
+ * next comma outside parentheses. Splitting on commas cut such URLs apart.
+ */
 export function rewriteSrcset(
 	srcset: string,
 	context: ScramjetContext,
 	meta: URLMeta
 ) {
-	const sources = srcset.split(/ .*,/).map((src) => src.trim());
-	const rewrittenSources = sources.map((source) => {
-		// Split into URLs and descriptors (if any)
-		// e.g. url0, url1 1.5x, url2 2x
-		const [url, ...descriptors] = source.split(/\s+/);
+	const isSpace = (c: string) =>
+		c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+	const out: string[] = [];
+	const n = srcset.length;
+	let i = 0;
+	while (i < n) {
+		while (i < n && (isSpace(srcset[i]) || srcset[i] === ",")) i++;
+		if (i >= n) break;
 
-		// Rewrite the URLs and keep the descriptors (if any)
-		const rewrittenUrl = rewriteUrl(url.trim(), context, meta);
+		const start = i;
+		while (i < n && !isSpace(srcset[i])) i++;
+		let url = String_slice(srcset, start, i);
+		let descriptors = "";
 
-		return descriptors.length > 0
-			? `${rewrittenUrl} ${descriptors.join(" ")}`
-			: rewrittenUrl;
-	});
+		if (url[url.length - 1] === ",") {
+			// a URL ending in commas has no descriptors, and the commas end it
+			let end = url.length;
+			while (end > 0 && url[end - 1] === ",") end--;
+			url = String_slice(url, 0, end);
+		} else {
+			const from = i;
+			let depth = 0;
+			while (i < n) {
+				const c = srcset[i];
+				if (c === "(") depth++;
+				else if (c === ")") depth--;
+				else if (c === "," && depth <= 0) break;
+				i++;
+			}
+			descriptors = String_trim(String_slice(srcset, from, i));
+			i++;
+		}
 
-	return rewrittenSources.join(", ");
+		const rewritten = rewriteUrl(url, context, meta);
+		out[out.length] = descriptors ? rewritten + " " + descriptors : rewritten;
+	}
+
+	return out.join(", ");
 }
 
-// function base64ToBytes(base64) {
-// 	const binString = atob(base64);
+/**
+ * The event handler content attributes, which carry javascript rather than a
+ * value. Exported because the client's attribute layer has to rewrite the same
+ * set when a page writes one through `setAttribute` - a name that is rewritten
+ * at parse time and not at run time is a hole, not an optimisation.
+ */
+/**
+ * The window's handlers for the events a listener is handed a stand-in for
+ * (see `client/shared/event.ts`): the only content attributes a trusted one
+ * of them ever reaches, and only on these elements, which hold the window's
+ * handlers.
+ */
+const standInHandlers = ["onmessage", "onhashchange", "onstorage"];
+const windowHandlerElements = ["body", "frameset"];
 
-// 	return Uint8Array.from(binString, (m) => m.codePointAt(0));
-// }
+/**
+ * What an event handler content attribute's body runs first, so that its
+ * `event` is the same stand-in a listener would have been handed - or
+ * nothing at all when a listener would never have seen it.
+ *
+ * The browser compiles the attribute as a function of `event` and calls it
+ * with the real event itself, past every listener wrapper scramjet has. So
+ * the stand-in has to be made from inside: `event` is rebound to it before a
+ * line of the page's code runs. The function answers itself for an event to
+ * drop, since a falsy value is one a handler can be given. Only on the
+ * elements where it is `event`: an SVG element's handler calls it `evt`, and
+ * an assignment there would replace `window.event`.
+ */
+export function eventHandlerPrelude(
+	context: ScramjetContext,
+	element: string,
+	attribute: string
+): string {
+	if (
+		Array_indexOf(windowHandlerElements, element) === -1 ||
+		Array_indexOf(standInHandlers, attribute) === -1
+	) {
+		return "";
+	}
 
-const eventAttributes = [
+	const standin = context.config.globals.standinfn;
+
+	return `if((event=${standin}(event))===${standin})return;`;
+}
+
+export const eventAttributes = [
 	"onbeforexrselect",
 	"onabort",
 	"onbeforeinput",
@@ -600,4 +839,30 @@ const eventAttributes = [
 	"onscrollend",
 	"onscrollsnapchange",
 	"onscrollsnapchanging",
+	"onanimationcancel",
+	"onbeforecopy",
+	"onbeforecut",
+	"onbeforepaste",
+	"oncommand",
+	// https://html.spec.whatwg.org/multipage/webappapis.html#windoweventhandlers -
+	// on a body or frameset they are the window's handlers, and run like any
+	// other
+	"onafterprint",
+	"onbeforeprint",
+	"onbeforeunload",
+	"onhashchange",
+	"onlanguagechange",
+	"onmessage",
+	"onmessageerror",
+	"onoffline",
+	"ononline",
+	"onpagehide",
+	"onpagereveal",
+	"onpageshow",
+	"onpageswap",
+	"onpopstate",
+	"onrejectionhandled",
+	"onstorage",
+	"onunhandledrejection",
+	"onunload",
 ];

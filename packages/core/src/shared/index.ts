@@ -1,10 +1,9 @@
-import { ScramjetConfig, ScramjetFlags, ScramjetVersionInfo } from "@/types";
-import DomHandler, { Element } from "domhandler";
+import { ScramjetConfig, ScramjetFlags } from "@/types";
+import type { Document, Element } from "./htmlparser";
 import { URLMeta } from "@rewriters/url";
 import { CookieJar } from "./cookie";
 import { TapInstance } from "@/Tap";
 import { HtmlContext } from "@/shared/rewriters/html";
-import { _RegExp } from "./snapshot";
 
 export * from "./cookie";
 export * from "./headers";
@@ -12,20 +11,32 @@ export * from "./htmlRules";
 export * from "./mime";
 export * from "./rewriters";
 
-export function flagEnabled(
-	flag: keyof ScramjetFlags,
-	context: ScramjetContext,
-	url: URL
-): boolean {
-	const value = context.config.flags[flag];
-	for (const regex in context.config.siteFlags) {
-		const partialflags = context.config.siteFlags[regex];
-		if (new _RegExp(regex).test(url.href) && flag in partialflags) {
-			return partialflags[flag];
-		}
-	}
+/** the flags whose value is a boolean, which is all but `incumbency` */
+export type BooleanFlag = {
+	[K in keyof ScramjetFlags]: ScramjetFlags[K] extends boolean ? K : never;
+}[keyof ScramjetFlags];
 
-	return value;
+/**
+ * A flag's value. Flags are fixed for a context: an embedder that wants
+ * different flags for different sites hands each its own config.
+ */
+export function flagValue<K extends keyof ScramjetFlags>(
+	flag: K,
+	context: ScramjetContext
+): ScramjetFlags[K] {
+	return context.config.flags[flag];
+}
+
+/**
+ * `flagValue` for the boolean flags. Kept separate so that a flag which is not
+ * a boolean - `incumbency` - cannot be read as if it were one, where every
+ * mode including `"none"` would come back truthy.
+ */
+export function flagEnabled(
+	flag: BooleanFlag,
+	context: ScramjetContext
+): boolean {
+	return flagValue(flag, context);
 }
 export type ScramjetInterface = {
 	codecEncode: (input: string) => string;
@@ -33,7 +44,7 @@ export type ScramjetInterface = {
 
 	getInjectScripts(
 		meta: URLMeta,
-		handler: DomHandler,
+		root: Document,
 		htmlcontext: HtmlContext,
 		script: (src: string) => Element
 	): Element[];
@@ -59,7 +70,7 @@ export type ScramjetContext = {
 export type HtmlRewriterHooks = {
 	pre: {
 		context: {
-			handler: DomHandler;
+			root: Document;
 			meta: URLMeta;
 			origHtml: string;
 			htmlcontext: HtmlContext;
@@ -67,7 +78,7 @@ export type HtmlRewriterHooks = {
 	};
 	post: {
 		context: {
-			handler: DomHandler;
+			root: Document;
 			meta: URLMeta;
 			origHtml: string;
 			htmlcontext: HtmlContext;

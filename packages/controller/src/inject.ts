@@ -22,7 +22,6 @@ import {
 	type CookieSyncOptions,
 	type ScramjetConfig,
 	type ScramjetContext,
-	type TrackedHistoryState,
 } from "@mercuryworkshop/scramjet";
 
 const MessagePort_postMessage = MessagePort.prototype.postMessage;
@@ -181,14 +180,15 @@ type Init = {
 	codecEncode: (input: string) => string;
 	codecDecode: (input: string) => string;
 	initHeaders: RawHeaders;
-	history: TrackedHistoryState[];
+	/** document.referrer, for a document the proxy served. */
+	referrer?: string;
 };
 
 export function load(init: Init) {
 	if (SCRAMJETCLIENT in globalThis) {
 		((globalThis as any)[SCRAMJETCLIENT] as ScramjetClient).syncDocumentInit({
 			initHeaders: init.initHeaders,
-			history: init.history,
+			referrer: init.referrer,
 			cookies: init.cookies,
 		});
 		return;
@@ -201,13 +201,6 @@ export function load(init: Init) {
 	setWasm(wasm);
 
 	new ExecutionContextWrapper(globalThis, init);
-}
-
-function createFrameId() {
-	return `${Array(8)
-		.fill(0)
-		.map(() => Math.floor(Math.random() * 36).toString(36))
-		.join("")}`;
 }
 
 class ExecutionContextWrapper {
@@ -290,9 +283,6 @@ class ExecutionContextWrapper {
 
 	injectScramjet() {
 		const frame = this.global.frameElement as HTMLIFrameElement | null;
-		if (frame && !frame.name) {
-			window.name = frame.name = createFrameId();
-		}
 		let controllerFrame = frame?.[CONTROLLERFRAME];
 		let isTopLevel = true;
 		if (!controllerFrame) {
@@ -304,10 +294,8 @@ class ExecutionContextWrapper {
 					currentwin = currentwin.parent.window;
 					continue;
 				}
-				const currentFrame = currentclient.descriptors.get(
-					"window.frameElement",
-					currentwin
-				);
+				const currentFrame = new currentclient.native.window(currentwin)
+					.frameElement;
 				if (currentFrame && currentFrame[CONTROLLERFRAME]) {
 					controllerFrame = currentFrame[CONTROLLERFRAME];
 					break;
@@ -345,11 +333,14 @@ class ExecutionContextWrapper {
 				const context = new ExecutionContextWrapper(frameself, {
 					...this.init,
 					cookies: this.cookieJar.dump(),
+					// a frame hooked before the proxy serves it anything keeps the
+					// browser's referrer, not this document's
+					referrer: undefined,
 				});
 				return context.client;
 			},
 			initHeaders: this.init.initHeaders,
-			history: this.init.history,
+			referrer: this.init.referrer,
 		});
 		const frameInitContext = {
 			window: this.global.window,

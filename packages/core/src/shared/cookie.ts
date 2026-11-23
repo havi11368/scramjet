@@ -1,6 +1,12 @@
 // thnank you node unblocker guy
-import { JSON_parse, JSON_stringify } from "@/shared/snapshot";
-import { _Date } from "./snapshot";
+import {
+	JSON_parse,
+	JSON_stringify,
+	Number_isFinite,
+	Object_keys,
+	_Date,
+	_Map,
+} from "@/shared/snapshot";
 import parse from "./set-cookie-parser";
 
 export type Cookie = {
@@ -14,12 +20,13 @@ export type Cookie = {
 	secure?: boolean;
 	httpOnly?: boolean;
 	sameSite?: string; // "strict"|"lax"|"none" or titlecase variants from parsers
+	partitioned?: boolean;
 };
 
 export class CookieJar {
 	private cookies: Record<string, Cookie> = {};
 	// Index by domain (without leading dot)
-	private byDomain: Map<string, Cookie[]> = new Map();
+	private byDomain: _Map<string, Cookie[]> = new _Map();
 
 	private defaultPath(url: URL): string {
 		const pathname = url.pathname;
@@ -77,7 +84,7 @@ export class CookieJar {
 
 			const hostOnly = !parsedCookie.domain;
 			const expiresTime = parsedCookie.expires?.getTime();
-			const expires = Number.isFinite(expiresTime) ? expiresTime : undefined;
+			const expires = Number_isFinite(expiresTime) ? expiresTime : undefined;
 			const cookie: Cookie = {
 				...parsedCookie,
 				hostOnly,
@@ -94,7 +101,7 @@ export class CookieJar {
 			const id = `${cookie.domain}@${cookie.path}@${cookie.name}`;
 
 			if (typeof cookie.maxAge === "number") {
-				if (!Number.isFinite(cookie.maxAge)) {
+				if (!Number_isFinite(cookie.maxAge)) {
 					delete cookie.maxAge;
 				} else if (cookie.maxAge <= 0) {
 					this.removeById(id);
@@ -111,15 +118,19 @@ export class CookieJar {
 		}
 	}
 
-	// SameSite enforcement context passed to getCookies.
+	// SameSite enforcement context passed to getCookieList / getCookies.
 	// "strict"     – same-site request; all cookies allowed
 	// "lax"        – cross-site top-level GET/HEAD navigation; Strict blocked, Lax+None allowed
 	// "cross-site" – cross-site subresource or non-GET navigation; only None allowed
-	getCookies(
+	//
+	// The cookies matching `url`, as the stored records. `getCookies` serializes
+	// these for a Cookie header or `document.cookie`; the Cookie Store API needs
+	// the attributes too, so the matching lives here and the two share it.
+	getCookieList(
 		url: URL,
 		fromJs: boolean,
 		sameSiteContext: "strict" | "lax" | "cross-site" = "strict"
-	): string {
+	): Cookie[] {
 		const now = _Date.now();
 		const hostname = url.hostname;
 		const pathname = url.pathname;
@@ -160,7 +171,15 @@ export class CookieJar {
 			key = dot === -1 ? undefined : key.slice(dot + 1);
 		}
 
-		return validCookies
+		return validCookies;
+	}
+
+	getCookies(
+		url: URL,
+		fromJs: boolean,
+		sameSiteContext: "strict" | "lax" | "cross-site" = "strict"
+	): string {
+		return this.getCookieList(url, fromJs, sameSiteContext)
 			.map((cookie) =>
 				cookie.name ? `${cookie.name}=${cookie.value}` : cookie.value
 			)
@@ -169,19 +188,19 @@ export class CookieJar {
 
 	load(cookies: string | Record<string, Cookie>) {
 		if (typeof cookies === "object") {
-			console.error("??");
+			dbg.error("CookieJar.load was handed an object, not a serialized jar");
 			return;
 		}
 		const parsed: Record<string, Cookie> = JSON_parse(cookies);
 		this.cookies = {};
 		this.byDomain.clear();
-		const ids = Object.keys(parsed);
+		const ids = Object_keys(parsed);
 		for (let i = 0; i < ids.length; i++) {
 			const id = ids[i];
 			const c = parsed[id];
 			if (typeof c.expires === "string") {
-				const t = Date.parse(c.expires as unknown as string);
-				c.expires = Number.isFinite(t) ? t : undefined;
+				const t = _Date.parse(c.expires as unknown as string);
+				c.expires = Number_isFinite(t) ? t : undefined;
 			}
 			this.cookies[id] = c;
 			this.indexCookie(c);

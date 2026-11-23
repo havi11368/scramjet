@@ -2,8 +2,10 @@ import {
 	Object_defineProperty,
 	Number_isSafeInteger,
 	Error,
+	TextDecoder_decode,
+	Reflect_apply,
 } from "@/shared/snapshot";
-import { SCRAMJETCLIENT, SCRAMJETCLIENTNAME } from "@/symbols";
+import { base64ToBytes } from "@/shared/util";
 import { ProxyCtx, ScramjetClient } from "@client/index";
 
 enum RewriteType {
@@ -36,26 +38,35 @@ function getEnd(rewrite: Rewrite): number {
 	throw "unreachable";
 }
 
-function registerRewrites(
+export function registerRewrites(
 	client: ScramjetClient,
-	buf: Array<number>,
+	buf: string | Uint8Array,
 	tag: string
 ) {
-	const sourcemap = Uint8Array.from(buf);
-	const view = new DataView(sourcemap.buffer);
-	const decoder = new TextDecoder("utf-8");
+	// a script rewritten in the service worker carries its map inline as base64,
+	// because it can only reach us as source text. one rewritten in this realm
+	// hands the buffer over directly
+	const sourcemap = typeof buf === "string" ? base64ToBytes(buf) : buf;
+	// indexing the bytes directly rather than through a DataView, whose
+	// prototype methods the page can replace
+	const u32 = (at: number) =>
+		(sourcemap[at] |
+			(sourcemap[at + 1] << 8) |
+			(sourcemap[at + 2] << 16) |
+			(sourcemap[at + 3] << 24)) >>>
+		0;
 
 	const rewrites: Rewrite[] = [];
 
-	const rewritelen = view.getUint32(0, true);
+	const rewritelen = u32(0);
 	let cursor = 4;
 	for (let i = 0; i < rewritelen; i++) {
-		const start = view.getUint32(cursor, true);
+		const start = u32(cursor);
 		cursor += 4;
-		const size = view.getUint32(cursor, true);
+		const size = u32(cursor);
 		cursor += 4;
 
-		const type = view.getUint8(cursor) as RewriteType;
+		const type = sourcemap[cursor] as RewriteType;
 		cursor += 1;
 
 		if (type == RewriteType.Insert) {
@@ -63,10 +74,10 @@ function registerRewrites(
 		} else if (type == RewriteType.Replace) {
 			const end = start + size;
 
-			const oldLen = view.getUint32(cursor, true);
+			const oldLen = u32(cursor);
 			cursor += 4;
 
-			const oldStr = decoder.decode(
+			const oldStr = TextDecoder_decode(
 				sourcemap.subarray(cursor, cursor + oldLen)
 			);
 
@@ -113,11 +124,15 @@ function doUnrewrite(
 	client: ScramjetClient,
 	ctx: ProxyCtx<"Function.prototype.toString", "apply">
 ) {
-	const stringified: string = ctx.fn.call(ctx.this);
+	// not `ctx.fn.call`, which looks `call` up on the page-writable
+	// Function.prototype
+	const stringified: string = Reflect_apply(ctx.fn, ctx.this, []);
 
 	const extracted = extractTag(stringified);
 	if (!extracted) return ctx.return(stringified);
-	const [tag, tagOffset, tagStart] = extracted;
+	const tag = extracted[0];
+	const tagOffset = extracted[1];
+	const tagStart = extracted[2];
 
 	const fnStart = tagStart - tagOffset;
 	const fnEnd = fnStart + stringified.length;
@@ -141,12 +156,13 @@ function doUnrewrite(
 		if (getEnd(rewrites[end]) < fnEnd) end++;
 		else break;
 	}
-	const fnrewrites = rewrites.slice(i, end);
-
 	let newString = "";
 	let lastpos = 0;
 
-	for (const rewrite of fnrewrites) {
+	// indexed over the range rather than a `slice` to `for...of`: this runs
+	// for every `toString` of a rewritten function
+	for (; i < end; i++) {
+		const rewrite = rewrites[i];
 		newString += stringified.slice(lastpos, rewrite.start - fnStart);
 
 		if (rewrite.type === RewriteType.Insert) {
@@ -169,9 +185,9 @@ export const enabled = (client: ScramjetClient) =>
 	client.flagEnabled("sourcemaps");
 
 export default function (client: ScramjetClient, self: Self) {
-	// every script will push a sourcemap
+	// a script rewritten outside the client pushes its own sourcemap
 	Object_defineProperty(self, client.config.globals.pushsourcemapfn, {
-		value: (buf: Array<number>, tag: string) => {
+		value: (buf: string | Uint8Array, tag: string) => {
 			// const before = performance.now();
 			registerRewrites(client, buf, tag);
 			// if (client.flagEnabled("rewriterLogs")) {

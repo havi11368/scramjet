@@ -1,6 +1,6 @@
 {
 	"name": "@mercuryworkshop/scramjet-utils",
-	"version": "0.0.3",
+	"version": "0.0.4",
 	"description": "Utilities for Scramjet proxy integrations",
 	"type": "module",
 	"packageManager": "pnpm@10.12.1",
@@ -21,12 +21,6 @@
 	"files": [
 		"dist"
 	],
-	"scripts": {
-		"build": "cd ../.. && rspack build --mode production",
-		"prepack": "pnpm run build",
-		"prepublishOnly": "npx only-allow pnpm",
-		"pub": "pnpm publish --no-git-checks --access public"
-	},
 	"peerDependencies": {
 		"@mercuryworkshop/scramjet": "*",
 		"@mercuryworkshop/scramjet-controller": "*",

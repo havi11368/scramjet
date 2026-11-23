@@ -19,6 +19,46 @@ function getGlobalScope(scope) {
 	return s;
 }
 
+/**
+ * `class extends XMLHttpRequest` in an interceptor names the real interface so
+ * TypeScript resolves `super.open(...)` against lib.dom. It reads no global at
+ * runtime: for an `Intercept()` argument the build rewrites it to
+ * `iface("XMLHttpRequest")` (tools/intercept-heritage-loader.mjs), and
+ * Intercept() replaces the prototype link with the snapshotted natives before
+ * anything calls through it.
+ *
+ * Only a bare identifier directly in the heritage position is exempt — a
+ * member expression like `class extends globalThis.Foo` still reports.
+ */
+function isClassHeritage(identifier) {
+	const parent = identifier.parent;
+
+	return (
+		!!parent &&
+		(parent.type === "ClassDeclaration" || parent.type === "ClassExpression") &&
+		parent.superClass === identifier
+	);
+}
+
+/**
+ * `typeof Window` in a type annotation. The scope analyser files these as
+ * *value* references, because a type query names a value rather than a type —
+ * but it is erased before anything runs, so it reads no global. Covers the
+ * qualified form (`typeof a.b`) too, where only the leftmost name is
+ * referenced.
+ */
+function isTypeQuery(identifier) {
+	let node = identifier;
+	let parent = node.parent;
+
+	while (parent?.type === "TSQualifiedName" && parent.left === node) {
+		node = parent;
+		parent = node.parent;
+	}
+
+	return parent?.type === "TSTypeQuery" && parent.exprName === node;
+}
+
 const noGlobalsPlugin = {
 	rules: {
 		"no-globals": {
@@ -62,6 +102,9 @@ const noGlobalsPlugin = {
 
 						function reportGlobal(identifier) {
 							if (!identifier || allowlist.has(identifier.name)) {
+								return;
+							}
+							if (isClassHeritage(identifier) || isTypeQuery(identifier)) {
 								return;
 							}
 							if (reported.has(identifier)) {

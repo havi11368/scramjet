@@ -1,6 +1,10 @@
-import { flagEnabled } from "@/shared";
 import { ScramjetClient } from "@client/index";
-import { Reflect_apply } from "@/shared/snapshot";
+import {
+	Object_getOwnPropertyDescriptor,
+	Reflect_apply,
+	Symbol_iterator,
+	Array_includes,
+} from "@/shared/snapshot";
 
 export const enabled = (client: ScramjetClient) =>
 	client.flagEnabled("captureErrors");
@@ -11,17 +15,17 @@ export function argdbg(arg, recurse = []) {
 		case "object":
 			if (
 				arg &&
-				arg[Symbol.iterator] &&
-				typeof arg[Symbol.iterator] === "function"
+				arg[Symbol_iterator] &&
+				typeof arg[Symbol_iterator] === "function"
 			)
 				for (const prop in arg) {
 					// make sure it's not a getter
-					const desc = Object.getOwnPropertyDescriptor(arg, prop);
+					const desc = Object_getOwnPropertyDescriptor(arg, prop);
 					if (desc && desc.get) continue;
 
 					const ar = arg[prop];
-					if (recurse.includes(ar)) continue;
-					recurse.push(ar);
+					if (Array_includes(recurse, ar)) continue;
+					recurse[recurse.length] = ar;
 					argdbg(ar, recurse);
 				}
 			break;
@@ -29,6 +33,8 @@ export function argdbg(arg, recurse = []) {
 }
 
 export default function (client: ScramjetClient, self: GlobalThis) {
+	// taken once, before page code can replace it
+	// eslint-disable-next-line scramjet-core/no-globals
 	const warn = console.warn;
 	self.$scramerr = function scramerr(e) {
 		warn("CAUGHT ERROR", e);

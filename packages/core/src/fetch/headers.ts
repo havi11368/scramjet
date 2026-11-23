@@ -1,6 +1,7 @@
 import {
 	rewriteUrl,
 	ScramjetContext,
+	carriedHeaderName,
 	ScramjetHeaders,
 	unrewriteUrl,
 	URLMeta,
@@ -11,8 +12,26 @@ import {
 	ScramjetFetchRequest,
 } from ".";
 import { RawHeaders } from "@mercuryworkshop/proxy-transports";
-import { _URL, _Set } from "@/shared/snapshot";
-import { createReferrerString } from "./util";
+import { SafeSet } from "@/shared/htmlparser/safe";
+import {
+	_URL,
+	_Set,
+	Array_includes,
+	String_split,
+	String_startsWith,
+	String_toLowerCase,
+} from "@/shared/snapshot";
+import {
+	createReferrerString,
+	DEFAULT_REFERRER_POLICY,
+	isDocument,
+} from "./util";
+import { isFetchPreload } from "@/shared/htmlRules";
+import {
+	applyClientHints,
+	clientHintsAllowed,
+	withoutUaHints,
+} from "./clienthints";
 
 /**
  * Headers for security policy features that haven't been emulated yet
@@ -25,6 +44,11 @@ const SEC_HEADERS = new _Set([
 	"content-security-policy-report-only",
 	"expect-ct",
 	"feature-policy",
+	// the proxy blanks every `integrity` it passes to the browser, so under a
+	// policy that demands one nothing would load - scramjet's own scripts first
+	// https://w3c.github.io/webappsec-subresource-integrity/#integrity-policy-section
+	"integrity-policy",
+	"integrity-policy-report-only",
 	"origin-isolation",
 	"strict-transport-security",
 	"upgrade-insecure-requests",
@@ -37,25 +61,114 @@ const SEC_HEADERS = new _Set([
 	// This needs to be emulated, but for right now it isn't that important of a feature to be worried about
 	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Clear-Site-Data
 	"clear-site-data",
-]) as _Set<string>;
+]);
 
 /**
  * Headers that are actually URLs that need to be rewritten
  */
-const URL_HEADERS = new _Set([
-	"location",
-	"content-location",
-	"referer",
-]) as _Set<string>;
+const URL_HEADERS = new _Set(["location", "content-location", "referer"]);
+
+/**
+ * Split `value` at each `separator` outside a `<URI-Reference>` and outside a
+ * quoted-string.
+ * https://www.rfc-editor.org/rfc/rfc8288#section-3
+ */
+function splitLinkHeader(value: string, separator: string): string[] {
+	const parts: string[] = [];
+	let start = 0;
+	let inUri = false;
+	let inQuote = false;
+	for (let i = 0; i < value.length; i++) {
+		const c = value[i];
+		if (inQuote) {
+			if (c === "\\") i++;
+			else if (c === '"') inQuote = false;
+		} else if (inUri) {
+			if (c === ">") inUri = false;
+		} else if (c === '"') {
+			inQuote = true;
+		} else if (c === "<") {
+			inUri = true;
+		} else if (c === separator) {
+			parts.push(value.substring(start, i));
+			start = i + 1;
+		}
+	}
+	parts.push(value.substring(start));
+
+	return parts;
+}
+
+function linkParamValue(value: string): string {
+	value = value.trim();
+	if (
+		value.length >= 2 &&
+		value[0] === '"' &&
+		value[value.length - 1] === '"'
+	) {
+		return value.slice(1, -1).replace(/\\(.)/g, "$1");
+	}
+
+	return value;
+}
 
 function rewriteLinkHeader(
 	link: string,
 	context: ScramjetContext,
 	meta: URLMeta
 ) {
-	return link.replace(/<([^>]+)>/gi, (_match, p1) => {
-		return `<${rewriteUrl(p1, context, meta)}>`;
-	});
+	return splitLinkHeader(link, ",")
+		.map((linkValue) => {
+			const [target, ...rawParams] = splitLinkHeader(linkValue, ";");
+			const params = rawParams.map((param) => {
+				const eq = param.indexOf("=");
+				const name = (eq === -1 ? param : param.substring(0, eq))
+					.trim()
+					.toLowerCase();
+				const value =
+					eq === -1 ? null : linkParamValue(param.substring(eq + 1));
+
+				return { raw: param, name, value };
+			});
+			const getParam = (name: string) =>
+				params.find((param) => param.name === name)?.value ?? null;
+
+			// a preload's digest is checked against the body the browser gets,
+			// which is the rewritten one - so it goes, as an element's `integrity`
+			// does in htmlRules, except on a `fetch` preload whose body is as-is
+			const keepIntegrity = isFetchPreload(getParam);
+			// a module's URL is marked as one wherever it is loaded from; an
+			// unmarked preload never matches the module's own request, so the
+			// module would be fetched twice
+			const isModule = Array_includes(
+				String_split(String_toLowerCase(getParam("rel") ?? ""), /\s+/),
+				"modulepreload"
+			);
+
+			return [
+				target.replace(
+					/<([^>]+)>/,
+					(_match, url) => `<${rewriteUrl(url, context, meta, { isModule })}>`
+				),
+				...params
+					.filter((param) => keepIntegrity || param.name !== "integrity")
+					.map((param) => param.raw),
+			].join(";");
+		})
+		.join(",");
+}
+
+export function attachCarriedHeaders(
+	headers: ScramjetHeaders,
+	rawHeaders: RawHeaders
+) {
+	for (const [key, value] of rawHeaders) {
+		if (key.toLowerCase().startsWith("set-cookie")) {
+			// this is purely for browser consumption via Headers.get, and set-cookie is always hidden from js
+			continue;
+		}
+		headers.append(carriedHeaderName(key), value);
+	}
 }
 
 export async function rewriteResponseHeaders(
@@ -65,9 +178,30 @@ export async function rewriteResponseHeaders(
 	rawHeaders: RawHeaders
 ): Promise<ScramjetHeaders> {
 	const headers = ScramjetHeaders.fromRawHeaders(rawHeaders);
+	attachCarriedHeaders(headers, rawHeaders);
+
+	// the browser applies the last policy it recognizes out of every field,
+	// so they go on as the one list rather than as the last field alone
+	// https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header
+	const policies: string[] = [];
+	for (const [name, value] of rawHeaders) {
+		if (name.toLowerCase() === "referrer-policy") policies.push(value);
+	}
+	if (policies.length > 1) headers.set("referrer-policy", policies.join(", "));
 
 	for (const cspHeader of SEC_HEADERS) {
 		headers.delete(cspHeader);
+	}
+
+	// the UA hints are the target origin's, handled in `clienthints.ts`: the
+	// browser would keep them for the proxy's origin, and restart a
+	// navigation a second time over them
+	for (const name of ["accept-ch", "critical-ch"]) {
+		const value = headers.get(name);
+		if (value === null) continue;
+		const rest = withoutUaHints(value);
+		if (rest) headers.set(name, rest);
+		else headers.delete(name);
 	}
 
 	for (const urlHeader of URL_HEADERS) {
@@ -109,11 +243,122 @@ export async function rewriteResponseHeaders(
 		headers.set("Cross-Origin-Opener-Policy", "same-origin");
 	}
 
-	if (parsed.destination === "document" || parsed.destination === "iframe") {
-		headers.set("Referrer-Policy", "unsafe-url");
+	return headers;
+}
+
+/**
+ * The site's URL for a URL the browser handed the service worker as a
+ * referrer, or null when it has none: an http(s) URL outside the proxy is the
+ * embedder's, not a site's.
+ */
+function unrewriteReferrer(
+	url: URL,
+	handler: ScramjetFetchHandler
+): _URL | null {
+	if (!String_startsWith(url.href, handler.context.prefix.href)) return null;
+	try {
+		return new _URL(unrewriteUrl(url, handler.context));
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The URL the request's referrer is taken from, before its policy is applied.
+ *
+ * The browser has already worked out which document, stylesheet, module or
+ * worker the referrer comes from, and which policy applies, and handed both to
+ * the service worker - only in the proxy's URL space. Every proxied URL is
+ * same-origin with every other, so the policy it applied there left the URL
+ * whole unless it asks for no referrer at all or for an origin only, or the
+ * URL was too long. An origin-only referrer is the proxy's own, and the site's
+ * origin has to come from elsewhere: the one the page stamped on the URL it
+ * asked for, or the client that asked.
+ */
+function referrerSource(
+	handler: ScramjetFetchHandler,
+	request: ScramjetFetchRequest,
+	parsed: ScramjetFetchParsed
+): _URL | null {
+	// a redirect hands on the referrer the hops before it cut down, which can
+	// only be cut down further
+	if (parsed.referrerSourceUrl !== undefined) return parsed.referrerSourceUrl;
+
+	if (!request.rawReferrer) return null;
+	let raw: _URL;
+	try {
+		raw = new _URL(request.rawReferrer);
+	} catch {
+		return null;
 	}
 
-	return headers;
+	const whole = unrewriteReferrer(raw, handler);
+	if (whole) return whole;
+
+	// anything else from outside the proxy's origin is nothing the site knows
+	const prefix = handler.context.prefix;
+	if (raw.origin !== prefix.origin) return null;
+
+	const client = request.rawClientUrl
+		? unrewriteReferrer(request.rawClientUrl, handler)
+		: null;
+	const clientIsSite =
+		client && (client.protocol === "http:" || client.protocol === "https:");
+
+	if (raw.href === raw.origin + "/") {
+		// cut down to an origin, by the policy or for being too long as the
+		// proxy's URL, in which case the origin is all that is sent
+		const origin = parsed.fetchReferrerOrigin ?? parsed.fetchInitiatorOrigin;
+		if (origin) {
+			try {
+				return new _URL(origin + "/");
+			} catch {
+				// fall through to the client
+			}
+		}
+
+		return clientIsSite ? new _URL(client.origin + "/") : null;
+	}
+
+	// the proxy's own script asked on the site's behalf, as a dynamic import()
+	// does - unless the client is the embedder, whose navigations of the frame
+	// are the user's and have no referrer
+	return clientIsSite ? client : null;
+}
+
+/**
+ * The Referer header a request is sent with, or null for none.
+ *
+ * https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer
+ */
+export function determineReferrer(
+	handler: ScramjetFetchHandler,
+	request: ScramjetFetchRequest,
+	parsed: ScramjetFetchParsed
+): string | null {
+	const policy = request.rawReferrerPolicy || DEFAULT_REFERRER_POLICY;
+	const source = referrerSource(handler, request, parsed);
+	if (!source) return null;
+
+	return createReferrerString(source, parsed.url, policy) || null;
+}
+
+/**
+ * What document.referrer reads in a document served for this request.
+ *
+ * That is the Referer it was requested with - except after a redirect, where
+ * Chrome puts that Referer through the policy the navigation started out with
+ * rather than the one the redirects left it with.
+ */
+export function documentReferrer(parsed: ScramjetFetchParsed): string {
+	if (!parsed.referrer) return "";
+	if (parsed.initialReferrerPolicy === undefined) return parsed.referrer;
+
+	return createReferrerString(
+		new _URL(parsed.referrer),
+		parsed.url,
+		parsed.initialReferrerPolicy
+	);
 }
 
 export function rewriteRequestHeaders(
@@ -126,32 +371,31 @@ export function rewriteRequestHeaders(
 	// avoid leaking the scramjet referer
 	headers.delete("Referer");
 
-	const rawOriginUrl =
-		parsed.referrerSourceUrl !== undefined
-			? parsed.referrerSourceUrl
-			: request.rawClientUrl ||
-				(request.rawReferrer ? new _URL(request.rawReferrer) : undefined);
-	const originUrl =
-		rawOriginUrl &&
-		rawOriginUrl.pathname.startsWith(handler.context.prefix.pathname)
-			? new _URL(unrewriteUrl(rawOriginUrl, handler.context))
-			: rawOriginUrl;
-
-	if (
-		rawOriginUrl &&
-		rawOriginUrl.pathname.startsWith(handler.context.prefix.pathname)
-	) {
-		headers.set("Origin", originUrl.origin);
-
-		const referer = createReferrerString(
-			originUrl,
-			parsed.url,
-			parsed.referrerPolicy ?? null
-		);
-		if (referer) headers.set("Referer", referer);
+	// Origin and the SameSite context are the initiator's: the referrer is the
+	// wrong place to look for it, since its policy is free to cut it down to
+	// the proxy's origin or drop it.
+	const initiator = resolveFetchInitiatorUrl(request, parsed, handler);
+	headers.delete("Origin");
+	// https://fetch.spec.whatwg.org/#origin-header - only for a method other
+	// than GET or HEAD, or a cors or websocket request: a plain GET for a
+	// script, an image or a document carries none. The mode is
+	// `computeFetchMode`'s, since the service worker reports it against the
+	// proxy's URL space
+	if (initiator) {
+		const method = (request.method || "GET").toUpperCase();
+		const mode = computeFetchMode(request, parsed);
+		if (
+			(method !== "GET" && method !== "HEAD") ||
+			mode === "cors" ||
+			mode === "websocket"
+		) {
+			headers.set("Origin", initiator.origin);
+		}
 	}
 
-	const sameSiteContext = computeSameSiteContext(request, parsed, originUrl);
+	if (parsed.referrer) headers.set("Referer", parsed.referrer);
+
+	const sameSiteContext = computeSameSiteContext(request, parsed, initiator);
 	const cookies = handler.context.cookieJar.getCookies(
 		parsed.url,
 		false,
@@ -163,6 +407,10 @@ export function rewriteRequestHeaders(
 	}
 
 	applyFetchMetadataHeaders(headers, request, parsed, handler);
+	// After everything else, and keyed on the TARGET origin: the browser put
+	// the low-entropy three on this request for the PROXY's origin, and the
+	// high-entropy ones are owed to whoever asked for them by name.
+	applyClientHints(headers, parsed.url, clientHintsAllowed(parsed));
 
 	return headers;
 }
@@ -223,10 +471,12 @@ function applyFetchMetadataHeaders(
 	// and fall back to a destination-based default for everything else.
 	headers.set("Sec-Fetch-Mode", computeFetchMode(request, parsed));
 
+	let emulatedTopLevel = false;
 	if (parsed.destination === "iframe") {
 		if (!parsed.isIframe) {
 			// emulate a top-level navigation
 			headers.set("Sec-Fetch-Dest", "document");
+			emulatedTopLevel = true;
 		} else {
 			headers.set("Sec-Fetch-Dest", "iframe");
 		}
@@ -250,6 +500,26 @@ function applyFetchMetadataHeaders(
 		request.initialHeaders.get("sec-fetch-user") === "?1"
 	) {
 		headers.set("Sec-Fetch-User", "?1");
+	} else if (emulatedTopLevel && site === "none") {
+		// The Dest emulation two blocks up is only half of the lie. Measured
+		// against Chromium 155, a browser attaches `Sec-Fetch-User` to a
+		// navigation if and only if
+		// transient user activation is live -- the same frame, the same URL,
+		// navigated from a click sends `?1` and navigated from a timer six
+		// seconds later does not.
+		//
+		// `Sec-Fetch-Site: none` means browser-initiated: a typed URL, a
+		// bookmark, a new tab. Every way of producing one is a user acting, so
+		// Chrome never sends this combination without `?1`, and claiming
+		// `Dest: document` + `Mode: navigate` + `Site: none` while withholding
+		// it produces a request no browser makes. That is worse than either
+		// lie alone, because it is the ENTRY navigation -- the request an
+		// anti-bot decides on before a line of the page's JavaScript runs.
+		//
+		// Only here. A scripted `location.href` inside the guest computes a
+		// real site of same-origin or cross-site, takes neither branch, and
+		// keeps correctly saying nothing.
+		headers.set("Sec-Fetch-User", "?1");
 	}
 
 	// Sec-Fetch-Storage-Access: per https://privacycg.github.io/storage-access-headers/.
@@ -264,6 +534,63 @@ function applyFetchMetadataHeaders(
 	if (site === "cross-site" && requestIncludesCredentials(request, parsed)) {
 		headers.set("Sec-Fetch-Storage-Access", "none");
 	}
+
+	applyPriorityHeader(headers, parsed);
+
+	// No `accept-encoding`: it is the transport's to send, because the
+	// transport is what decodes the response. Chromium offers `gzip, deflate,
+	// br, zstd`, but a server takes whichever it likes best, and a transport
+	// offered an encoding it cannot decode fails the request outright -
+	// libcurl answers zstd with "Unrecognized or bad HTTP Content or
+	// Transfer-Encoding".
+}
+
+/**
+ * RFC 9218 extensible priorities, as Chrome sends them.
+ *
+ * Measured against Chromium 155 over HTTP/2, one page pulling one of each kind
+ * against a throwaway h2 server. The numbers are recorded here because this is
+ * where they are used:
+ *
+ *   document   u=0, i      iframe   u=0, i      style  u=0
+ *   script     u=1         font     u=1         fetch  u=1, i
+ *   image      u=2, i      favicon  u=1, i
+ *   script defer/async     (no header at all)
+ *   image from `new Image()` after parse      `i`
+ *
+ * The default is `u=3, i=0`, and Chrome omits whatever matches it -- which is
+ * why a deferred script sends nothing and a late image sends `i` alone.
+ *
+ * Only the destinations whose value does not depend on something a service
+ * worker cannot see. `script` and `image` are deliberately absent: the same
+ * destination is `u=1` or nothing depending on `defer`/`async`, and `u=2, i`
+ * or `i` depending on whether the parser or a script asked for it, and neither
+ * distinction survives into `event.request`. Guessing one of the two would
+ * replace "header missing" with "header wrong", which is the same size of
+ * difference and harder to find later.
+ *
+ * Sent regardless of protocol because the protocol is not known here -- ALPN
+ * settles it inside the transport, long after this. A browser sends none on
+ * HTTP/1.1, so there it is one header more than Chromium's; only the transport
+ * learns the protocol, so dropping it there is the transport's to do.
+ */
+function applyPriorityHeader(
+	headers: ScramjetHeaders,
+	parsed: ScramjetFetchParsed
+) {
+	const priority = {
+		document: "u=0, i",
+		iframe: "u=0, i",
+		frame: "u=0, i",
+		embed: "u=0, i",
+		object: "u=0, i",
+		style: "u=0",
+		font: "u=1",
+		empty: "u=1, i",
+	}[parsed.destination || "empty"];
+
+	// one the page set itself is sent as it is
+	if (priority && !headers.has("priority")) headers.set("Priority", priority);
 }
 
 /**
@@ -328,7 +655,17 @@ function computeFetchMode(
 	request: ScramjetFetchRequest,
 	parsed: ScramjetFetchParsed
 ): string {
-	if (parsed.fetchMode) return parsed.fetchMode;
+	if (parsed.fetchMode) {
+		// the mode was stamped on the URL when the Request was made, and a
+		// fetch can override it: `fetch(new Request(url, { mode: "no-cors" }),
+		// { mode: "cors" })`. A cors or no-cors the browser reports is the one
+		// the fetch has
+		if (request.mode === "cors" || request.mode === "no-cors") {
+			return request.mode;
+		}
+
+		return parsed.fetchMode;
+	}
 	const dest = parsed.destination;
 	if (
 		dest === "document" ||
@@ -355,38 +692,61 @@ function computeFetchMode(
 }
 
 /**
- * Resolve the unrewritten URL of the page (or worker) that initiated this
- * request. Used by Sec-Fetch-Site, which always compares against the original
- * initiator regardless of Referer policy.
+ * The site URL of the page (or worker) that initiated this request, or
+ * undefined for one the browser started itself. Its origin is the request's
+ * Origin, SameSite context and Sec-Fetch-Site, whatever the referrer policy.
+ *
+ * What the browser hands over is believed first: for a subresource, the
+ * client that asked for it; for a navigation, the document it came from,
+ * which is its referrer where the policy left that whole - its client is the
+ * frame being navigated. `$io`, stamped by the page's own code, only stands
+ * in where the browser says nothing: a referrer cut down by its policy, a
+ * client that is an about:srcdoc or an about:blank, a top-level navigation
+ * with no client. The client of a navigation comes last, after `$io`: it is
+ * a document the frame is leaving, often not the one that sent it there.
  */
-function resolveFetchInitiatorUrl(
+export function resolveFetchInitiatorUrl(
 	request: ScramjetFetchRequest,
 	parsed: ScramjetFetchParsed,
 	handler: ScramjetFetchHandler
 ): URL | undefined {
-	// On any hop after the first, the propagated initiator origin is the
-	// authoritative source. rawReferrer may have been replaced with the
-	// previous hop's URL, and rawClientUrl is unset for top-level navigations.
-	if (parsed.fetchInitiatorOrigin) {
+	const site = (url: URL | null | undefined): URL | undefined => {
+		if (!url || !String_startsWith(url.href, handler.context.prefix.href)) {
+			return undefined;
+		}
 		try {
-			return new _URL(parsed.fetchInitiatorOrigin);
+			const unrewritten = new _URL(unrewriteUrl(url, handler.context));
+			// a data: document is an initiator too, of an opaque origin
+			return unrewritten.protocol === "http:" ||
+				unrewritten.protocol === "https:" ||
+				unrewritten.protocol === "data:"
+				? unrewritten
+				: undefined;
 		} catch {
-			// fall through to the fallbacks below
+			return undefined;
+		}
+	};
+	let referrer: URL | undefined;
+	if (request.rawReferrer) {
+		try {
+			referrer = site(new _URL(request.rawReferrer));
+		} catch {
+			// not a URL at all
 		}
 	}
-	const candidate =
-		request.rawClientUrl ||
-		(request.rawReferrer ? new _URL(request.rawReferrer) : undefined);
-	if (!candidate) return undefined;
-	if (candidate.pathname.startsWith(handler.context.prefix.pathname)) {
-		return new _URL(unrewriteUrl(candidate, handler.context));
+	const client = site(request.rawClientUrl);
+	let stamped: URL | undefined;
+	if (parsed.fetchInitiatorOrigin) {
+		try {
+			stamped = new _URL(parsed.fetchInitiatorOrigin);
+		} catch {
+			// an opaque origin, which is no URL's
+		}
 	}
-	// The candidate URL is outside scramjet's logical space (e.g. the runway
-	// harness wrapper page, or a chrome:// page kicking off a navigation).
-	// There's no meaningful "initiator" in the proxied site's frame of
-	// reference, so treat it as a browser-initiated request — Sec-Fetch-Site
-	// will be "none".
-	return undefined;
+
+	return isDocument(parsed)
+		? (referrer ?? stamped ?? client)
+		: (client ?? referrer ?? stamped);
 }
 
 /**
@@ -503,26 +863,41 @@ function computeSameSiteContext(
 }
 
 /**
- * Compute the "registrable domain" (eTLD+1) of a hostname for same-site comparison.
- * This is a simplified implementation that handles common test cases
- * (localhost, IPs, and typical domain structures) without a full PSL lookup.
+ * The "registrable domain" (eTLD+1) of a hostname, for same-site checks:
+ * cookies' SameSite, a redirect's site, a WebSocket handshake's cookies.
+ *
+ * No public suffix list: the last two labels, or three under a common
+ * second-level suffix (`co.uk`, `com.au`, ...). Where it is wrong it is wrong
+ * towards same-site, so a cookie the browser would send is never held back.
+ * A leading `www.` is not special: `www.example.co.uk` and `ws.example.co.uk`
+ * are one site, which stripping it made them not.
  */
-function registrableDomain(hostname: string): string {
+const secondLevel = new SafeSet([
+	"co",
+	"com",
+	"org",
+	"net",
+	"ac",
+	"gov",
+	"edu",
+	"ne",
+	"or",
+	"go",
+	"gv",
+]);
+
+export function registrableDomain(hostname: string): string {
 	// IPv4 / IPv6: site = exact IP
 	if (/^[\d.]+$/.test(hostname) || hostname.includes(":")) return hostname;
 
 	const labels = hostname.split(".");
-	if (labels.length <= 1) return hostname; // bare hostname like "localhost"
+	const tld = labels[labels.length - 1];
+	// every `*.localhost` is the one site `localhost`
+	if (tld === "localhost") return "localhost";
+	if (labels.length <= 2) return hostname; // "example.com"
 
-	// Strip a leading "www." for same-site comparison so that
-	// www.example.com and example.com are treated as the same site.
-	// More complex cases (e.g. s1.s2.example.co.uk) are not handled here
-	// but are uncommon in test environments.
-	if (labels[0] === "www") return labels.slice(1).join(".");
+	const take =
+		tld.length === 2 && secondLevel.has(labels[labels.length - 2]) ? 3 : 2;
 
-	// For two-label hostnames like "example.com", use as-is
-	if (labels.length === 2) return hostname;
-
-	// For longer hostnames, use the last two labels as a rough eTLD+1
-	return labels.slice(-2).join(".");
+	return labels.slice(-take).join(".");
 }
